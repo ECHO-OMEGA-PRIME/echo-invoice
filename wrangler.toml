@@ -1,0 +1,27 @@
+name = "echo-invoice"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[triggers]
+crons = ["0 8 * * *", "0 1 * * 1"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-invoice"
+database_id = "b30080b7-5c64-4e2c-bffc-7d30f96721ba"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "78d17ed073c3426da9aef9a140007991"
+
+[[services]]
+binding = "ENGINE_RUNTIME"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
+
+[[services]]
+binding = "EMAIL_SENDER"
+service = "echo-email-sender"
