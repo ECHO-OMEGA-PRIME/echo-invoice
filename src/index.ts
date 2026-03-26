@@ -11,6 +11,7 @@ interface Env {
   ENGINE_RUNTIME: Fetcher;
   SHARED_BRAIN: Fetcher;
   EMAIL_SENDER: Fetcher;
+  ECHO_API_KEY?: string;
 }
 
 interface RLState { c: number; t: number }
@@ -51,6 +52,20 @@ app.use('*', async (c, next) => {
   const isWrite = ['POST','PUT','PATCH','DELETE'].includes(c.req.method);
   const limited = await rateLimit(c.env.CACHE, `${ip}:${isWrite ? 'w' : 'r'}`, isWrite ? 60 : 200);
   if (limited) return json({ error: 'Rate limited' }, 429);
+  return next();
+});
+
+// ── Auth middleware ──
+app.use('*', async (c, next) => {
+  const method = c.req.method;
+  const path = new URL(c.req.url).pathname;
+  if (method === 'GET' || method === 'OPTIONS' || method === 'HEAD' || path === '/health' || path === '/status' || path.startsWith('/public/')) return next();
+  const apiKey = c.req.header('X-Echo-API-Key') || '';
+  const bearer = (c.req.header('Authorization') || '').replace('Bearer ', '');
+  const expected = c.env.ECHO_API_KEY;
+  if (!expected || (apiKey !== expected && bearer !== expected)) {
+    return json({ error: 'Unauthorized', message: 'Valid X-Echo-API-Key or Bearer token required for write operations' }, 401);
+  }
   return next();
 });
 
