@@ -14,6 +14,8 @@ interface Env {
   ECHO_API_KEY?: string;
 }
 
+// TODO: Consider batching sequential D1 queries with db.batch() for performance
+
 interface RLState { c: number; t: number }
 
 const app = new Hono<{ Bindings: Env }>();
