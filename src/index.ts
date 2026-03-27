@@ -35,6 +35,11 @@ const tid = (c: any) => c.req.header('X-Tenant-ID') || c.req.query('tenant_id') 
 const json = (d: unknown, s = 200) => new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 
 // ── Rate Limiting ──
+// Structured logging helper (auto-added by Evolution Engine)
+function structuredLog(level: string, message: string, meta: Record<string, any> = {}): void {
+  console.log(JSON.stringify({ timestamp: new Date().toISOString(), level, message, ...meta }));
+}
+
 async function rateLimit(kv: KVNamespace, key: string, limit: number, windowSec = 60): Promise<boolean> {
   const rlKey = `rl:${key}`;
   const now = Date.now();
