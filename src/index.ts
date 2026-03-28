@@ -96,8 +96,8 @@ app.use('*', async (c, next) => {
 });
 
 // ── Health ──
-app.get('/', (c) => c.json({ service: 'echo-invoice', version: '1.0.0', status: 'operational' }));
-app.get('/health', (c) => json({ status: 'ok', service: 'echo-invoice', version: '1.1.0', time: new Date().toISOString() }));
+app.get('/', (c) => c.json({ service: 'echo-invoice', version: '2.0.0', status: 'operational', features: ['stripe-checkout', 'payment-links', 'public-portal', 'webhook-verification'] }));
+app.get('/health', (c) => json({ status: 'ok', service: 'echo-invoice', version: '2.0.0', stripe: !!c.env.STRIPE_SECRET_KEY, time: new Date().toISOString() }));
 
 // ═══════════════ TENANTS ═══════════════
 app.post('/tenants', async (c) => {
@@ -908,6 +908,376 @@ app.get('/invoices/:id/pdf', async (c) => {
   } catch (e: any) {
     console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'PDF render failed', error: e?.message }));
     return c.json({ error: 'Render error' }, 500);
+  }
+});
+
+// ═══════════════ STRIPE PAYMENT CHECKOUT ═══════════════
+
+async function generatePaymentToken(invoiceId: string, tenantId: string, hmacKey: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', encoder.encode(hmacKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(`${invoiceId}:${tenantId}`));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Create Stripe Checkout session for an invoice
+app.post('/invoices/:id/checkout', async (c) => {
+  try {
+    const t = tid(c); const invId = c.req.param('id');
+    const inv = await c.env.DB.prepare('SELECT i.*, c.name as client_name, c.email as client_email FROM invoices i LEFT JOIN clients c ON i.client_id=c.id WHERE i.id=? AND i.tenant_id=?').bind(invId, t).first() as any;
+    if (!inv) return json({ error: 'Invoice not found' }, 404);
+    if (inv.status === 'paid' || inv.status === 'void') return json({ error: `Invoice is already ${inv.status}` }, 400);
+    if (!c.env.STRIPE_SECRET_KEY) return json({ error: 'Stripe not configured' }, 503);
+
+    const amountCents = Math.round((inv.amount_due || inv.total) * 100);
+    if (amountCents <= 0) return json({ error: 'No amount due' }, 400);
+
+    const baseUrl = new URL(c.req.url).origin;
+    const params = new URLSearchParams();
+    params.set('mode', 'payment');
+    params.set('payment_method_types[]', 'card');
+    params.set('line_items[0][price_data][currency]', (inv.currency || 'usd').toLowerCase());
+    params.set('line_items[0][price_data][unit_amount]', String(amountCents));
+    params.set('line_items[0][price_data][product_data][name]', `Invoice ${inv.invoice_number}`);
+    params.set('line_items[0][quantity]', '1');
+    params.set('success_url', `${baseUrl}/public/payment-success?session_id={CHECKOUT_SESSION_ID}`);
+    params.set('cancel_url', `${baseUrl}/public/payment-cancelled?invoice=${inv.invoice_number}`);
+    params.set('metadata[invoice_id]', invId);
+    params.set('metadata[tenant_id]', t);
+    params.set('metadata[invoice_number]', inv.invoice_number);
+    if (inv.client_email) params.set('customer_email', inv.client_email);
+
+    const stripeRes = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${c.env.STRIPE_SECRET_KEY}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    });
+    const session = await stripeRes.json() as any;
+    if (!stripeRes.ok) {
+      structuredLog('error', 'Stripe checkout failed', { error: session.error?.message });
+      return json({ error: 'Payment setup failed', detail: session.error?.message }, 502);
+    }
+
+    await c.env.DB.prepare("UPDATE invoices SET stripe_checkout_id=?,updated_at=datetime('now') WHERE id=?").bind(session.id, invId).run();
+    await logActivity(c.env.DB, t, 'invoice', invId, 'checkout_created', `Stripe Checkout: ${session.id}`);
+    return json({ checkout_url: session.url, session_id: session.id });
+  } catch (e: any) {
+    structuredLog('error', 'Checkout error', { error: e.message });
+    return c.json({ error: 'Checkout error' }, 500);
+  }
+});
+
+// Generate a shareable payment link for a client
+app.post('/invoices/:id/payment-link', async (c) => {
+  try {
+    const t = tid(c); const invId = c.req.param('id');
+    const inv = await c.env.DB.prepare('SELECT * FROM invoices WHERE id=? AND tenant_id=?').bind(invId, t).first() as any;
+    if (!inv) return json({ error: 'Invoice not found' }, 404);
+    if (inv.status === 'paid' || inv.status === 'void') return json({ error: `Invoice is ${inv.status}` }, 400);
+    if (!c.env.INVOICE_HMAC_KEY) return json({ error: 'HMAC key not configured' }, 503);
+
+    const token = await generatePaymentToken(invId, t, c.env.INVOICE_HMAC_KEY);
+    const baseUrl = new URL(c.req.url).origin;
+    const paymentUrl = `${baseUrl}/public/invoice/${invId}?token=${token}`;
+
+    await c.env.DB.prepare("UPDATE invoices SET payment_token=?,payment_url=?,updated_at=datetime('now') WHERE id=?").bind(token, paymentUrl, invId).run();
+    await logActivity(c.env.DB, t, 'invoice', invId, 'payment_link', 'Payment link generated');
+    return json({ payment_url: paymentUrl, token });
+  } catch (e: any) {
+    structuredLog('error', 'Payment link error', { error: e.message });
+    return c.json({ error: 'Error generating payment link' }, 500);
+  }
+});
+
+// ═══════════════ PUBLIC INVOICE PORTAL (no auth) ═══════════════
+
+// Public invoice view — token-based access for clients
+app.get('/public/invoice/:id', async (c) => {
+  try {
+    const invId = c.req.param('id');
+    const token = c.req.query('token');
+    if (!token) return new Response('Missing token', { status: 401 });
+
+    const inv = await c.env.DB.prepare('SELECT i.*, c.name as client_name, c.company as client_company, c.email as client_email, c.address as client_address, c.city as client_city, c.state as client_state, c.zip as client_zip, t.name as tenant_name, t.email as tenant_email, t.phone as tenant_phone, t.address as tenant_address FROM invoices i LEFT JOIN clients c ON i.client_id=c.id LEFT JOIN tenants t ON i.tenant_id=t.id WHERE i.id=?').bind(invId).first() as any;
+    if (!inv) return new Response('Invoice not found', { status: 404 });
+
+    if (c.env.INVOICE_HMAC_KEY) {
+      const expected = await generatePaymentToken(invId, inv.tenant_id, c.env.INVOICE_HMAC_KEY);
+      if (token !== expected) return new Response('Invalid token', { status: 403 });
+    }
+
+    // Mark as viewed
+    await c.env.DB.prepare("UPDATE invoices SET viewed_at=coalesce(viewed_at,datetime('now')),status=CASE WHEN status='sent' THEN 'viewed' ELSE status END WHERE id=?").bind(invId).run();
+
+    const items = await c.env.DB.prepare('SELECT * FROM invoice_items WHERE invoice_id=? ORDER BY sort_order').bind(invId).all();
+    const payments = await c.env.DB.prepare('SELECT * FROM payments WHERE invoice_id=? ORDER BY payment_date DESC').bind(invId).all();
+
+    if (c.req.header('Accept')?.includes('application/json')) {
+      return json({ ...inv, items: items.results, payments: payments.results });
+    }
+
+    const html = renderPublicInvoiceHTML(inv, items.results as any[], payments.results as any[], !!c.env.STRIPE_SECRET_KEY, invId, token);
+    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  } catch (e: any) {
+    structuredLog('error', 'Public invoice error', { error: e.message });
+    return new Response('Error loading invoice', { status: 500 });
+  }
+});
+
+// Payment success page
+app.get('/public/payment-success', async (c) => {
+  const sessionId = c.req.query('session_id');
+  return new Response(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Payment Successful</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#f8fafc}
+.card{max-width:480px;padding:40px;text-align:center;background:#fff;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.08)}
+.check{width:64px;height:64px;background:#dcfce7;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;font-size:32px}
+h1{color:#166534;font-size:24px;margin-bottom:8px}p{color:#64748b;margin-bottom:16px}</style></head>
+<body><div class="card"><div class="check">✓</div><h1>Payment Received</h1>
+<p>Thank you! Your payment has been processed successfully.</p>
+<p style="font-size:13px;color:#94a3b8">Session: ${sessionId ? String(sessionId).slice(0,30) + '...' : 'N/A'}</p>
+</div></body></html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+});
+
+// Payment cancelled page
+app.get('/public/payment-cancelled', (c) => {
+  const invoice = c.req.query('invoice') || '';
+  return new Response(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Payment Cancelled</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#f8fafc}
+.card{max-width:480px;padding:40px;text-align:center;background:#fff;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.08)}
+h1{color:#94a3b8;font-size:24px;margin-bottom:8px}p{color:#64748b;margin-bottom:16px}</style></head>
+<body><div class="card"><h1>Payment Cancelled</h1>
+<p>Your payment for invoice ${invoice ? '#' + String(invoice).replace(/[<>"'&]/g, '') : ''} was not completed.</p>
+<p>You can return to the invoice link to try again.</p></div></body></html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+});
+
+// ═══════════════ STRIPE WEBHOOK ═══════════════
+
+app.post('/webhooks/stripe', async (c) => {
+  try {
+    const body = await c.req.text();
+    const sig = c.req.header('stripe-signature') || '';
+
+    // Verify webhook signature if secret is configured
+    if (c.env.STRIPE_WEBHOOK_SECRET) {
+      const isValid = await verifyStripeSignature(body, sig, c.env.STRIPE_WEBHOOK_SECRET);
+      if (!isValid) {
+        structuredLog('warn', 'Invalid Stripe webhook signature');
+        return json({ error: 'Invalid signature' }, 401);
+      }
+    } else {
+      structuredLog('warn', 'STRIPE_WEBHOOK_SECRET not set — skipping signature verification');
+    }
+
+    const event = JSON.parse(body);
+    structuredLog('info', `Stripe webhook: ${event.type}`, { event_id: event.id });
+
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const invoiceId = session.metadata?.invoice_id;
+      const tenantId = session.metadata?.tenant_id;
+      if (!invoiceId || !tenantId) {
+        structuredLog('warn', 'Webhook missing invoice metadata', { session_id: session.id });
+        return json({ received: true, action: 'skipped' });
+      }
+
+      const amountPaid = (session.amount_total || 0) / 100;
+      const payId = uid();
+
+      // Record payment + update invoice atomically
+      await c.env.DB.batch([
+        c.env.DB.prepare('INSERT INTO payments (id,tenant_id,invoice_id,client_id,amount,method,reference,notes,payment_date) VALUES (?,?,?,(SELECT client_id FROM invoices WHERE id=?),?,?,?,?,date(\'now\'))')
+          .bind(payId, tenantId, invoiceId, invoiceId, amountPaid, 'stripe', `stripe:${session.payment_intent || session.id}`, `Stripe Checkout ${session.id}`),
+        c.env.DB.prepare(`UPDATE invoices SET amount_paid = amount_paid + ?, amount_due = MAX(0, total - (amount_paid + ?)), status = CASE WHEN total - (amount_paid + ?) <= 0 THEN 'paid' ELSE 'partial' END, paid_date = CASE WHEN total - (amount_paid + ?) <= 0 THEN date('now') ELSE paid_date END, stripe_payment_intent = ?, updated_at = datetime('now') WHERE id = ? AND tenant_id = ?`)
+          .bind(amountPaid, amountPaid, amountPaid, amountPaid, session.payment_intent || '', invoiceId, tenantId),
+      ]);
+
+      // Update client totals
+      const inv = await c.env.DB.prepare('SELECT client_id FROM invoices WHERE id=?').bind(invoiceId).first() as any;
+      if (inv?.client_id) await updateClientTotals(c.env.DB, tenantId, inv.client_id);
+      await logActivity(c.env.DB, tenantId, 'payment', payId, 'stripe_payment', `Stripe payment $${amountPaid.toFixed(2)} for invoice ${invoiceId}`);
+
+      structuredLog('info', 'Invoice paid via Stripe', { invoice_id: invoiceId, amount: amountPaid, session_id: session.id });
+      return json({ received: true, action: 'payment_recorded', invoice_id: invoiceId, amount: amountPaid });
+    }
+
+    if (event.type === 'checkout.session.expired') {
+      const session = event.data.object;
+      const invoiceId = session.metadata?.invoice_id;
+      if (invoiceId) {
+        structuredLog('info', 'Checkout session expired', { invoice_id: invoiceId });
+        await logActivity(c.env.DB, session.metadata?.tenant_id || '', 'invoice', invoiceId, 'checkout_expired', `Checkout expired: ${session.id}`);
+      }
+      return json({ received: true, action: 'logged' });
+    }
+
+    return json({ received: true, action: 'ignored', type: event.type });
+  } catch (e: any) {
+    structuredLog('error', 'Webhook processing error', { error: e.message });
+    return json({ error: 'Webhook error' }, 500);
+  }
+});
+
+// Stripe webhook signature verification (HMAC-SHA256)
+async function verifyStripeSignature(payload: string, header: string, secret: string): Promise<boolean> {
+  try {
+    const parts = header.split(',').reduce((acc: Record<string, string>, part) => {
+      const [key, val] = part.split('=');
+      acc[key.trim()] = val;
+      return acc;
+    }, {});
+    const timestamp = parts['t'];
+    const signature = parts['v1'];
+    if (!timestamp || !signature) return false;
+
+    // Reject if timestamp is too old (5 min tolerance)
+    const age = Math.floor(Date.now() / 1000) - parseInt(timestamp);
+    if (age > 300 || age < -60) return false;
+
+    const signedPayload = `${timestamp}.${payload}`;
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(signedPayload));
+    const expected = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+    return expected === signature;
+  } catch { return false; }
+}
+
+// ═══════════════ SCHEMA MIGRATION ═══════════════
+
+app.post('/admin/migrate-stripe', async (c) => {
+  try {
+    const apiKey = c.req.header('X-Echo-API-Key') || '';
+    if (!c.env.ECHO_API_KEY || apiKey !== c.env.ECHO_API_KEY) return json({ error: 'Unauthorized' }, 401);
+    const results: string[] = [];
+    const cols = [
+      { name: 'payment_token', type: 'TEXT' },
+      { name: 'payment_url', type: 'TEXT' },
+      { name: 'stripe_checkout_id', type: 'TEXT' },
+      { name: 'stripe_payment_intent', type: 'TEXT' },
+    ];
+    for (const col of cols) {
+      try {
+        await c.env.DB.prepare(`ALTER TABLE invoices ADD COLUMN ${col.name} ${col.type}`).run();
+        results.push(`Added ${col.name}`);
+      } catch {
+        results.push(`${col.name} already exists`);
+      }
+    }
+    return json({ migrated: true, results });
+  } catch (e: any) {
+    return c.json({ error: 'Migration error', detail: e.message }, 500);
+  }
+});
+
+// ═══════════════ PUBLIC INVOICE HTML RENDERER ═══════════════
+
+function renderPublicInvoiceHTML(inv: any, items: any[], payments: any[], hasStripe: boolean, invoiceId: string, token: string): string {
+  const esc = (s: unknown) => String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const fmt = (n: unknown) => `$${Number(n || 0).toFixed(2)}`;
+  const isPaid = inv.status === 'paid';
+  const isVoid = inv.status === 'void';
+  const canPay = !isPaid && !isVoid && Number(inv.amount_due || 0) > 0;
+
+  const itemRows = items.map(i => `<tr><td>${esc(i.description)}</td><td class="r">${i.quantity}</td><td class="r">${fmt(i.unit_price)}</td><td class="r">${fmt(i.amount)}</td></tr>`).join('');
+  const payRows = payments.length ? payments.map(p => `<tr><td>${esc(p.payment_date)}</td><td>${esc(p.method)}</td><td class="r">${fmt(p.amount)}</td></tr>`).join('') : '';
+  const statusColor = isPaid ? '#166534' : inv.status === 'overdue' ? '#991b1b' : inv.status === 'viewed' ? '#0369a1' : '#64748b';
+  const statusBg = isPaid ? '#dcfce7' : inv.status === 'overdue' ? '#fee2e2' : inv.status === 'viewed' ? '#dbeafe' : '#f3f4f6';
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Invoice ${esc(inv.invoice_number)} — ${esc(inv.tenant_name || 'Echo Invoice')}</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1a1a2e;background:#f1f5f9;padding:20px}
+.wrap{max-width:800px;margin:0 auto;background:#fff;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.08);overflow:hidden}
+.topbar{background:#0f172a;color:#fff;padding:16px 32px;display:flex;justify-content:space-between;align-items:center}
+.topbar h2{font-size:18px;font-weight:600}.status{display:inline-block;padding:4px 14px;border-radius:20px;font-size:12px;font-weight:700;text-transform:uppercase;background:${statusBg};color:${statusColor}}
+.body{padding:32px}.row{display:flex;justify-content:space-between;gap:20px;margin-bottom:24px;flex-wrap:wrap}.col{flex:1;min-width:200px}
+.label{font-size:11px;text-transform:uppercase;color:#94a3b8;letter-spacing:0.5px;margin-bottom:4px}.val{font-size:14px;color:#1e293b}
+table{width:100%;border-collapse:collapse;margin:16px 0}th{text-align:left;padding:10px 12px;border-bottom:2px solid #e2e8f0;font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:0.5px}
+td{padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:14px}.r{text-align:right}
+.totals{margin-top:12px;display:flex;flex-direction:column;align-items:flex-end}.trow{display:flex;justify-content:space-between;width:240px;padding:4px 0;font-size:14px}
+.trow.total{font-size:20px;font-weight:700;border-top:2px solid #0f172a;padding-top:10px;margin-top:6px;color:#0f172a}
+.trow.due{font-size:18px;font-weight:700;color:#dc2626}
+.pay-btn{display:block;width:100%;max-width:360px;margin:24px auto 0;padding:16px;background:linear-gradient(135deg,#0f172a,#1e40af);color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;text-align:center;text-decoration:none;transition:transform 0.1s}
+.pay-btn:hover{transform:scale(1.02)}.pay-btn:active{transform:scale(0.98)}
+.paid-badge{display:block;width:100%;max-width:360px;margin:24px auto 0;padding:16px;background:#dcfce7;color:#166534;border-radius:10px;font-size:16px;font-weight:700;text-align:center}
+.footer{text-align:center;padding:16px;font-size:12px;color:#94a3b8;border-top:1px solid #f1f5f9;margin-top:24px}
+${payRows ? '.pay-hist{margin-top:24px}' : ''}
+@media(max-width:600px){.row{flex-direction:column}.body{padding:20px}}</style></head>
+<body><div class="wrap">
+<div class="topbar"><h2>${esc(inv.tenant_name || 'Invoice')}</h2><span class="status">${esc(inv.status)}</span></div>
+<div class="body">
+<div class="row"><div class="col"><div class="label">Invoice Number</div><div class="val" style="font-size:20px;font-weight:700">#${esc(inv.invoice_number)}</div></div>
+<div class="col" style="text-align:right"><div class="label">Issue Date</div><div class="val">${esc(inv.issue_date)}</div><div class="label" style="margin-top:8px">Due Date</div><div class="val" style="${inv.status==='overdue'?'color:#dc2626;font-weight:700':''}">${esc(inv.due_date)}</div></div></div>
+<div class="row"><div class="col"><div class="label">Bill To</div><div class="val"><strong>${esc(inv.client_name)}</strong>${inv.client_company?'<br/>'+esc(inv.client_company):''}${inv.client_address?'<br/>'+esc(inv.client_address):''}${inv.client_city?'<br/>'+esc(inv.client_city)+', '+esc(inv.client_state)+' '+esc(inv.client_zip):''}</div></div>
+${inv.po_number?`<div class="col" style="text-align:right"><div class="label">PO Number</div><div class="val">${esc(inv.po_number)}</div></div>`:''}</div>
+<table><thead><tr><th>Description</th><th class="r">Qty</th><th class="r">Unit Price</th><th class="r">Amount</th></tr></thead><tbody>${itemRows}</tbody></table>
+<div class="totals"><div class="trow"><span>Subtotal</span><span>${fmt(inv.subtotal)}</span></div>
+${Number(inv.tax_amount)>0?`<div class="trow"><span>Tax</span><span>${fmt(inv.tax_amount)}</span></div>`:''}
+${Number(inv.discount_amount)>0?`<div class="trow"><span>Discount</span><span>-${fmt(inv.discount_amount)}</span></div>`:''}
+${Number(inv.shipping)>0?`<div class="trow"><span>Shipping</span><span>${fmt(inv.shipping)}</span></div>`:''}
+<div class="trow total"><span>Total</span><span>${fmt(inv.total)}</span></div>
+${Number(inv.amount_paid)>0?`<div class="trow"><span>Paid</span><span style="color:#166534">${fmt(inv.amount_paid)}</span></div>`:''}
+${canPay?`<div class="trow due"><span>Balance Due</span><span>${fmt(inv.amount_due)}</span></div>`:''}</div>
+${payRows?`<div class="pay-hist"><div class="label" style="margin-bottom:8px">Payment History</div><table><thead><tr><th>Date</th><th>Method</th><th class="r">Amount</th></tr></thead><tbody>${payRows}</tbody></table></div>`:''}
+${inv.notes?`<div style="margin-top:20px"><div class="label">Notes</div><div class="val" style="margin-top:4px">${esc(inv.notes)}</div></div>`:''}
+${inv.terms?`<div style="margin-top:12px"><div class="label">Terms</div><div class="val" style="margin-top:4px">${esc(inv.terms)}</div></div>`:''}
+${isPaid?'<div class="paid-badge">✓ Paid in Full</div>':''}
+${canPay && hasStripe ? `<form method="POST" action="/public/invoice/${invoiceId}/pay?token=${token}"><button type="submit" class="pay-btn">Pay Now — ${fmt(inv.amount_due)}</button></form>` : ''}
+${canPay && !hasStripe ? `<div style="text-align:center;margin-top:20px;color:#64748b;font-size:14px">Contact us to arrange payment.</div>` : ''}
+</div><div class="footer">Powered by Echo Invoice • echo-ept.com</div></div></body></html>`;
+}
+
+// Public payment trigger — creates Stripe checkout from public portal
+app.post('/public/invoice/:id/pay', async (c) => {
+  try {
+    const invId = c.req.param('id');
+    const token = c.req.query('token');
+    if (!token) return new Response('Missing token', { status: 401 });
+
+    const inv = await c.env.DB.prepare('SELECT i.*, c.email as client_email FROM invoices i LEFT JOIN clients c ON i.client_id=c.id WHERE i.id=?').bind(invId).first() as any;
+    if (!inv) return new Response('Invoice not found', { status: 404 });
+
+    if (c.env.INVOICE_HMAC_KEY) {
+      const expected = await generatePaymentToken(invId, inv.tenant_id, c.env.INVOICE_HMAC_KEY);
+      if (token !== expected) return new Response('Invalid token', { status: 403 });
+    }
+
+    if (inv.status === 'paid' || inv.status === 'void') return new Response('Invoice already settled', { status: 400 });
+    if (!c.env.STRIPE_SECRET_KEY) return new Response('Payments not configured', { status: 503 });
+
+    const amountCents = Math.round((inv.amount_due || inv.total) * 100);
+    if (amountCents <= 0) return new Response('No amount due', { status: 400 });
+
+    const baseUrl = new URL(c.req.url).origin;
+    const params = new URLSearchParams();
+    params.set('mode', 'payment');
+    params.set('payment_method_types[]', 'card');
+    params.set('line_items[0][price_data][currency]', (inv.currency || 'usd').toLowerCase());
+    params.set('line_items[0][price_data][unit_amount]', String(amountCents));
+    params.set('line_items[0][price_data][product_data][name]', `Invoice ${inv.invoice_number}`);
+    params.set('line_items[0][quantity]', '1');
+    params.set('success_url', `${baseUrl}/public/payment-success?session_id={CHECKOUT_SESSION_ID}`);
+    params.set('cancel_url', `${baseUrl}/public/invoice/${invId}?token=${token}`);
+    params.set('metadata[invoice_id]', invId);
+    params.set('metadata[tenant_id]', inv.tenant_id);
+    params.set('metadata[invoice_number]', inv.invoice_number);
+    if (inv.client_email) params.set('customer_email', inv.client_email);
+
+    const stripeRes = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${c.env.STRIPE_SECRET_KEY}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    });
+    const session = await stripeRes.json() as any;
+    if (!stripeRes.ok) {
+      structuredLog('error', 'Public checkout failed', { error: session.error?.message });
+      return new Response('Payment setup failed', { status: 502 });
+    }
+
+    // Redirect to Stripe Checkout
+    return new Response(null, { status: 303, headers: { 'Location': session.url } });
+  } catch (e: any) {
+    structuredLog('error', 'Public pay error', { error: e.message });
+    return new Response('Error', { status: 500 });
   }
 });
 
