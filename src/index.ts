@@ -47,6 +47,13 @@ function structuredLog(level: string, message: string, meta: Record<string, any>
   console.log(JSON.stringify({ timestamp: new Date().toISOString(), level, message, ...meta }));
 }
 
+// CORS headers (auto-added by Evolution Engine)
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Echo-API-Key',
+};
+
 async function rateLimit(kv: KVNamespace, key: string, limit: number, windowSec = 60): Promise<boolean> {
   const rlKey = `rl:${key}`;
   const now = Date.now();
