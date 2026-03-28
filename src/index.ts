@@ -1,5 +1,5 @@
 /**
- * Echo Invoice v1.0.0 — AI-Powered Invoicing & Billing
+ * Echo Invoice v1.1.0 — AI-Powered Invoicing & Billing
  * Cloudflare Worker with Hono, D1, KV, service bindings
  */
 import { Hono } from 'hono';
@@ -91,7 +91,7 @@ app.use('*', async (c, next) => {
 
 // ── Health ──
 app.get('/', (c) => c.redirect('/health'));
-app.get('/health', (c) => json({ status: 'ok', service: 'echo-invoice', version: '1.0.0', time: new Date().toISOString() }));
+app.get('/health', (c) => json({ status: 'ok', service: 'echo-invoice', version: '1.1.0', time: new Date().toISOString() }));
 
 // ═══════════════ TENANTS ═══════════════
 app.post('/tenants', async (c) => {
@@ -201,10 +201,11 @@ app.get('/invoices', async (c) => {
 
 app.post('/invoices', async (c) => {
   const t = tid(c); const b = sanitizeBody(await c.req.json()); const id = uid();
-  // Get next invoice number
-  const tenant = await c.env.DB.prepare('SELECT invoice_prefix, next_invoice_number FROM tenants WHERE id=?').bind(t).first() as any;
+  // Atomically claim next invoice number: increment first, then read
+  await c.env.DB.prepare('UPDATE tenants SET next_invoice_number=next_invoice_number+1 WHERE id=?').bind(t).run();
+  const tenant = await c.env.DB.prepare('SELECT invoice_prefix, next_invoice_number, payment_terms_days FROM tenants WHERE id=?').bind(t).first() as any;
   const prefix = tenant?.invoice_prefix || 'INV';
-  const num = tenant?.next_invoice_number || 1001;
+  const num = (tenant?.next_invoice_number || 1002) - 1; // We already incremented, so subtract 1 to get the claimed number
   const invoiceNumber = `${prefix}-${String(num).padStart(5, '0')}`;
   // Calculate due date from payment terms
   const paymentTerms = (b.payment_terms_days as number) || tenant?.payment_terms_days || 30;
@@ -213,26 +214,26 @@ app.post('/invoices', async (c) => {
 
   await c.env.DB.prepare(`INSERT INTO invoices (id,tenant_id,client_id,invoice_number,status,issue_date,due_date,subtotal,tax_rate,tax_amount,discount_percent,discount_amount,shipping,total,amount_due,currency,notes,terms,footer,po_number) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .bind(id, t, b.client_id, invoiceNumber, 'draft', issueDate, dueDate, 0, b.tax_rate||0, 0, b.discount_percent||0, 0, b.shipping||0, 0, 0, b.currency||'USD', b.notes||null, b.terms||null, b.footer||null, b.po_number||null).run();
-  // Increment invoice number
-  await c.env.DB.prepare('UPDATE tenants SET next_invoice_number=next_invoice_number+1 WHERE id=?').bind(t).run();
 
   // Add items if provided
   const items = b.items as any[];
   if (items?.length) {
     let subtotal = 0;
+    let totalTax = 0;
     for (const item of items) {
       const iid = uid();
       const amount = (item.quantity || 1) * (item.unit_price || 0);
-      const taxAmt = amount * ((item.tax_rate || b.tax_rate || 0) / 100);
+      const itemTaxRate = item.tax_rate ?? b.tax_rate ?? 0;
+      const taxAmt = amount * (itemTaxRate / 100);
       subtotal += amount;
+      totalTax += taxAmt;
       await c.env.DB.prepare('INSERT INTO invoice_items (id,invoice_id,tenant_id,description,quantity,unit_price,amount,tax_rate,tax_amount,sort_order,product_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
-        .bind(iid, id, t, sanitize(item.description||''), item.quantity||1, item.unit_price||0, amount, item.tax_rate||b.tax_rate||0, taxAmt, item.sort_order||0, item.product_id||null).run();
+        .bind(iid, id, t, sanitize(item.description||''), item.quantity||1, item.unit_price||0, amount, itemTaxRate, taxAmt, item.sort_order||0, item.product_id||null).run();
     }
-    const taxAmount = subtotal * ((b.tax_rate as number)||0) / 100;
     const discountAmount = subtotal * ((b.discount_percent as number)||0) / 100;
-    const total = subtotal + taxAmount - discountAmount + ((b.shipping as number)||0);
+    const total = subtotal + totalTax - discountAmount + ((b.shipping as number)||0);
     await c.env.DB.prepare('UPDATE invoices SET subtotal=?,tax_amount=?,discount_amount=?,total=?,amount_due=? WHERE id=?')
-      .bind(subtotal, taxAmount, discountAmount, total, total, id).run();
+      .bind(subtotal, totalTax, discountAmount, total, total, id).run();
   }
 
   await logActivity(c.env.DB, t, 'invoice', id, 'created', `Invoice ${invoiceNumber} created`);
@@ -605,6 +606,12 @@ app.get('/activity', async (c) => {
 
 // ═══════════════ CRON: OVERDUE + RECURRING ═══════════════
 app.get('/__cron', async (c) => {
+  const apiKey = c.req.header('X-Echo-API-Key') || '';
+  const bearer = (c.req.header('Authorization') || '').replace('Bearer ', '');
+  const expected = c.env.ECHO_API_KEY;
+  if (!expected || (apiKey !== expected && bearer !== expected)) {
+    return json({ error: 'Unauthorized' }, 401);
+  }
   const results: string[] = [];
   // Mark overdue invoices
   const overdue = await c.env.DB.prepare("UPDATE invoices SET status='overdue',updated_at=datetime('now') WHERE status IN ('sent','partial') AND due_date<date('now')").run();
@@ -623,15 +630,18 @@ app.get('/__cron', async (c) => {
     let subtotal = 0;
     await c.env.DB.prepare(`INSERT INTO invoices (id,tenant_id,client_id,invoice_number,status,issue_date,due_date,subtotal,tax_rate,total,amount_due,is_recurring,recurring_id) VALUES (?,?,?,?,'draft',?,?,0,?,0,0,1,?)`)
       .bind(invId, rec.tenant_id, rec.client_id, invoiceNumber, today, dueDate, rec.tax_rate||0, rec.id).run();
+    let totalTax = 0;
     for (const item of items) {
       const amount = (item.quantity||1) * (item.unit_price||0);
+      const itemTaxRate = item.tax_rate ?? rec.tax_rate ?? 0;
+      const itemTaxAmt = amount * (itemTaxRate / 100);
       subtotal += amount;
-      await c.env.DB.prepare('INSERT INTO invoice_items (id,invoice_id,tenant_id,description,quantity,unit_price,amount) VALUES (?,?,?,?,?,?,?)')
-        .bind(uid(), invId, rec.tenant_id, item.description, item.quantity||1, item.unit_price||0, amount).run();
+      totalTax += itemTaxAmt;
+      await c.env.DB.prepare('INSERT INTO invoice_items (id,invoice_id,tenant_id,description,quantity,unit_price,amount,tax_rate,tax_amount) VALUES (?,?,?,?,?,?,?,?,?)')
+        .bind(uid(), invId, rec.tenant_id, item.description, item.quantity||1, item.unit_price||0, amount, itemTaxRate, itemTaxAmt).run();
     }
-    const taxAmount = subtotal * (rec.tax_rate||0) / 100;
-    const total = subtotal + taxAmount;
-    await c.env.DB.prepare('UPDATE invoices SET subtotal=?,tax_amount=?,total=?,amount_due=? WHERE id=?').bind(subtotal, taxAmount, total, total, invId).run();
+    const total = subtotal + totalTax;
+    await c.env.DB.prepare('UPDATE invoices SET subtotal=?,tax_amount=?,total=?,amount_due=? WHERE id=?').bind(subtotal, totalTax, total, total, invId).run();
     // Advance next_date
     const nextDate = advanceDate(rec.next_date, rec.frequency, rec.interval_value||1);
     const newStatus = rec.end_date && nextDate > rec.end_date ? 'completed' : 'active';
@@ -673,7 +683,7 @@ async function updateClientTotals(db: D1Database, tenantId: string, clientId: st
 }
 
 async function logActivity(db: D1Database, tenantId: string, entityType: string, entityId: string, action: string, details: string) {
-  await db.prepare('INSERT INTO activity_log (id,tenant_id,entity_type,entity_id,action,details) VALUES (?,?,?,?,?,?)')
+  await db.prepare('INSERT INTO activity_log (id,tenant_id,entity_type,entity_id,action,details,created_at) VALUES (?,?,?,?,?,?,datetime(\'now\'))')
     .bind(uid(), tenantId, entityType, entityId, action, details).run();
 }
 
@@ -727,13 +737,17 @@ export default {
       let sub = 0;
       await env.DB.prepare(`INSERT INTO invoices (id,tenant_id,client_id,invoice_number,status,issue_date,due_date,subtotal,tax_rate,total,amount_due,is_recurring,recurring_id) VALUES (?,?,?,?,'draft',?,?,0,?,0,0,1,?)`)
         .bind(invId, rec.tenant_id, rec.client_id, invNum, today, due, rec.tax_rate||0, rec.id).run();
+      let subTax = 0;
       for (const it of items) {
-        const amt = (it.quantity||1)*(it.unit_price||0); sub += amt;
-        await env.DB.prepare('INSERT INTO invoice_items (id,invoice_id,tenant_id,description,quantity,unit_price,amount) VALUES (?,?,?,?,?,?,?)')
-          .bind(uid(), invId, rec.tenant_id, it.description, it.quantity||1, it.unit_price||0, amt).run();
+        const amt = (it.quantity||1)*(it.unit_price||0);
+        const itTaxRate = it.tax_rate ?? rec.tax_rate ?? 0;
+        const itTaxAmt = amt * (itTaxRate / 100);
+        sub += amt; subTax += itTaxAmt;
+        await env.DB.prepare('INSERT INTO invoice_items (id,invoice_id,tenant_id,description,quantity,unit_price,amount,tax_rate,tax_amount) VALUES (?,?,?,?,?,?,?,?,?)')
+          .bind(uid(), invId, rec.tenant_id, it.description, it.quantity||1, it.unit_price||0, amt, itTaxRate, itTaxAmt).run();
       }
-      const tax = sub*(rec.tax_rate||0)/100; const tot = sub+tax;
-      await env.DB.prepare('UPDATE invoices SET subtotal=?,tax_amount=?,total=?,amount_due=? WHERE id=?').bind(sub,tax,tot,tot,invId).run();
+      const tot = sub+subTax;
+      await env.DB.prepare('UPDATE invoices SET subtotal=?,tax_amount=?,total=?,amount_due=? WHERE id=?').bind(sub,subTax,tot,tot,invId).run();
       const next = advanceDate(rec.next_date, rec.frequency, rec.interval_value||1);
       await env.DB.prepare("UPDATE recurring_invoices SET next_date=?,status=CASE WHEN ?!='' AND ?>? THEN 'completed' ELSE 'active' END,invoices_generated=invoices_generated+1,last_generated_at=datetime('now') WHERE id=?")
         .bind(next, rec.end_date||'', next, rec.end_date||'9999-12-31', rec.id).run();
