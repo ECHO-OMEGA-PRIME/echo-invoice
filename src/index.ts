@@ -12,6 +12,9 @@ interface Env {
   SHARED_BRAIN: Fetcher;
   EMAIL_SENDER: Fetcher;
   ECHO_API_KEY?: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+  INVOICE_HMAC_KEY?: string;
 }
 
 interface RLState { c: number; t: number }
