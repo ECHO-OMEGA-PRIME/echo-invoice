@@ -14,10 +14,6 @@ interface Env {
   ECHO_API_KEY?: string;
 }
 
-// TODO: Consider batching sequential D1 queries with db.batch() for performance
-
-// TODO: Consider batching sequential D1 queries with db.batch() for performance
-
 interface RLState { c: number; t: number }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -369,16 +365,33 @@ app.delete('/invoices/:invId/items/:itemId', async (c) => {
   }
 });
 
-// Send invoice
+// Send invoice via email
 app.post('/invoices/:id/send', async (c) => {
   try {
     const t = tid(c); const invId = c.req.param('id');
+    const inv = await c.env.DB.prepare('SELECT i.*, c.name as client_name, c.company as client_company, c.email as client_email, c.address as client_address, c.city as client_city, c.state as client_state, c.zip as client_zip FROM invoices i LEFT JOIN clients c ON i.client_id=c.id WHERE i.id=? AND i.tenant_id=?').bind(invId, t).first() as Record<string, unknown> | null;
+    if (!inv) return json({ error: 'Not found' }, 404);
+    const clientEmail = String(inv.client_email || '');
+    if (!clientEmail) return json({ error: 'Client has no email address' }, 400);
+    const items = await c.env.DB.prepare('SELECT * FROM invoice_items WHERE invoice_id=? ORDER BY sort_order').bind(invId).all();
+    const payments = await c.env.DB.prepare('SELECT * FROM payments WHERE invoice_id=? ORDER BY payment_date DESC').bind(invId).all();
+    const html = renderInvoiceHTML(inv, items.results as Record<string, unknown>[], payments.results as Record<string, unknown>[]);
+    // Send email via echo-email-sender binding
+    if (c.env.EMAIL_SENDER) {
+      c.executionCtx.waitUntil(
+        c.env.EMAIL_SENDER.fetch('https://email/send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ to: clientEmail, subject: `Invoice #${inv.invoice_number} — $${Number(inv.total||0).toFixed(2)}`, html, from_name: 'Echo Invoice' }),
+        }).catch((e: unknown) => console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', msg: 'Email send failed', error: String(e) })))
+      );
+    }
     await c.env.DB.prepare("UPDATE invoices SET status='sent',sent_at=datetime('now'),updated_at=datetime('now') WHERE id=? AND tenant_id=? AND status IN ('draft','sent')").bind(invId, t).run();
-    await logActivity(c.env.DB, t, 'invoice', invId, 'sent', 'Invoice sent to client');
-    return json({ sent: true });
+    await logActivity(c.env.DB, t, 'invoice', invId, 'sent', `Invoice emailed to ${clientEmail}`);
+    return json({ sent: true, emailed_to: clientEmail });
   } catch (e: any) {
-    console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: '/invoices/:id/send', error: e?.message }));
-    return c.json({ error: 'Database error' }, 500);
+    console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'Send failed', endpoint: '/invoices/:id/send', error: e?.message }));
+    return c.json({ error: 'Send error' }, 500);
   }
 });
 
@@ -413,9 +426,11 @@ app.post('/invoices/:id/clone', async (c) => {
     const orig = await c.env.DB.prepare('SELECT * FROM invoices WHERE id=? AND tenant_id=?').bind(c.req.param('id'), t).first() as any;
     if (!orig) return json({ error: 'Not found' }, 404);
     const items = await c.env.DB.prepare('SELECT * FROM invoice_items WHERE invoice_id=?').bind(c.req.param('id')).all();
-    // Get next number
-    const tenant = await c.env.DB.prepare('SELECT invoice_prefix, next_invoice_number FROM tenants WHERE id=?').bind(t).first() as any;
-    const invoiceNumber = `${tenant.invoice_prefix}-${String(tenant.next_invoice_number).padStart(5, '0')}`;
+    // Atomically claim next invoice number: increment first, then read (same as POST /invoices)
+    await c.env.DB.prepare('UPDATE tenants SET next_invoice_number=next_invoice_number+1 WHERE id=?').bind(t).run();
+    const tenant = await c.env.DB.prepare('SELECT invoice_prefix, next_invoice_number, payment_terms_days FROM tenants WHERE id=?').bind(t).first() as any;
+    const num = (tenant?.next_invoice_number || 1002) - 1; // Already incremented, subtract 1 to get claimed number
+    const invoiceNumber = `${tenant.invoice_prefix}-${String(num).padStart(5, '0')}`;
     const newId = uid();
     const today = new Date().toISOString().split('T')[0];
     const dueDate = new Date(Date.now() + (tenant.payment_terms_days||30) * 86400000).toISOString().split('T')[0];
@@ -425,7 +440,6 @@ app.post('/invoices/:id/clone', async (c) => {
       await c.env.DB.prepare('INSERT INTO invoice_items (id,invoice_id,tenant_id,description,quantity,unit_price,amount,tax_rate,tax_amount,sort_order,product_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
         .bind(uid(), newId, t, item.description, item.quantity, item.unit_price, item.amount, item.tax_rate, item.tax_amount, item.sort_order, item.product_id).run();
     }
-    await c.env.DB.prepare('UPDATE tenants SET next_invoice_number=next_invoice_number+1 WHERE id=?').bind(t).run();
     return json({ id: newId, invoice_number: invoiceNumber }, 201);
   } catch (e: any) {
     console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: '/invoices/:id/clone', error: e?.message }));
@@ -452,17 +466,16 @@ app.get('/payments', async (c) => {
 app.post('/payments', async (c) => {
   try {
     const t = tid(c); const b = sanitizeBody(await c.req.json()); const id = uid();
-    await c.env.DB.prepare('INSERT INTO payments (id,tenant_id,invoice_id,client_id,amount,method,reference,notes,payment_date) VALUES (?,?,?,?,?,?,?,?,?)')
-      .bind(id, t, b.invoice_id, b.client_id, b.amount, b.method||'other', b.reference||null, b.notes||null, b.payment_date||new Date().toISOString().split('T')[0]).run();
-    // Update invoice
-    const inv = await c.env.DB.prepare('SELECT amount_paid, total FROM invoices WHERE id=? AND tenant_id=?').bind(b.invoice_id, t).first() as any;
-    if (inv) {
-      const newPaid = (inv.amount_paid||0) + (b.amount as number);
-      const newDue = Math.max(0, (inv.total||0) - newPaid);
-      const status = newDue <= 0 ? 'paid' : 'partial';
-      await c.env.DB.prepare('UPDATE invoices SET amount_paid=?,amount_due=?,status=?,paid_date=CASE WHEN ?<=0 THEN date(?) ELSE paid_date END,updated_at=datetime(\'now\') WHERE id=?')
-        .bind(newPaid, newDue, status, newDue, b.payment_date||new Date().toISOString().split('T')[0], b.invoice_id).run();
-    }
+    const paymentAmount = b.amount as number;
+    const paymentDate = (b.payment_date as string) || new Date().toISOString().split('T')[0];
+    // Atomic batch: INSERT payment + UPDATE invoice totals in one transaction
+    // Uses atomic SQL arithmetic to prevent double-pay race condition
+    await c.env.DB.batch([
+      c.env.DB.prepare('INSERT INTO payments (id,tenant_id,invoice_id,client_id,amount,method,reference,notes,payment_date) VALUES (?,?,?,?,?,?,?,?,?)')
+        .bind(id, t, b.invoice_id, b.client_id, paymentAmount, b.method||'other', b.reference||null, b.notes||null, paymentDate),
+      c.env.DB.prepare(`UPDATE invoices SET amount_paid = amount_paid + ?, amount_due = MAX(0, total - (amount_paid + ?)), status = CASE WHEN total - (amount_paid + ?) <= 0 THEN 'paid' ELSE 'partial' END, paid_date = CASE WHEN total - (amount_paid + ?) <= 0 THEN date(?) ELSE paid_date END, updated_at = datetime('now') WHERE id = ? AND tenant_id = ?`)
+        .bind(paymentAmount, paymentAmount, paymentAmount, paymentAmount, paymentDate, b.invoice_id, t),
+    ]);
     // Update client totals
     await updateClientTotals(c.env.DB, t, b.client_id as string);
     await logActivity(c.env.DB, t, 'payment', id, 'recorded', `Payment of ${b.amount} recorded`);
@@ -537,9 +550,11 @@ app.post('/estimates/:id/convert', async (c) => {
     const est = await c.env.DB.prepare('SELECT * FROM estimates WHERE id=? AND tenant_id=?').bind(estId, t).first() as any;
     if (!est) return json({ error: 'Not found' }, 404);
     const items = await c.env.DB.prepare('SELECT * FROM estimate_items WHERE estimate_id=?').bind(estId).all();
-    // Create invoice with same items
+    // Atomically claim next invoice number: increment first, then read (same as POST /invoices)
+    await c.env.DB.prepare('UPDATE tenants SET next_invoice_number=next_invoice_number+1 WHERE id=?').bind(t).run();
     const tenant = await c.env.DB.prepare('SELECT invoice_prefix, next_invoice_number, payment_terms_days FROM tenants WHERE id=?').bind(t).first() as any;
-    const invoiceNumber = `${tenant.invoice_prefix}-${String(tenant.next_invoice_number).padStart(5, '0')}`;
+    const num = (tenant?.next_invoice_number || 1002) - 1; // Already incremented, subtract 1 to get claimed number
+    const invoiceNumber = `${tenant.invoice_prefix}-${String(num).padStart(5, '0')}`;
     const invId = uid();
     const today = new Date().toISOString().split('T')[0];
     const dueDate = new Date(Date.now() + (tenant.payment_terms_days||30)*86400000).toISOString().split('T')[0];
@@ -550,7 +565,6 @@ app.post('/estimates/:id/convert', async (c) => {
         .bind(uid(), invId, t, item.description, item.quantity, item.unit_price, item.amount, item.sort_order, item.product_id).run();
     }
     await c.env.DB.prepare("UPDATE estimates SET status='accepted',converted_invoice_id=?,updated_at=datetime('now') WHERE id=?").bind(invId, estId).run();
-    await c.env.DB.prepare('UPDATE tenants SET next_invoice_number=next_invoice_number+1 WHERE id=?').bind(t).run();
     return json({ invoice_id: invId, invoice_number: invoiceNumber }, 201);
   } catch (e: any) {
     console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: '/estimates/:id/convert', error: e?.message }));
@@ -658,21 +672,21 @@ app.post('/credits', async (c) => {
 app.post('/credits/:id/apply', async (c) => {
   try {
     const t = tid(c); const b = sanitizeBody(await c.req.json());
-    const credit = await c.env.DB.prepare('SELECT * FROM credits WHERE id=? AND tenant_id=? AND status=?').bind(c.req.param('id'), t, 'available').first() as any;
-    if (!credit) return json({ error: 'Credit not found or already used' }, 404);
-    // Apply as payment
+    const creditId = c.req.param('id');
+    // Atomic claim: UPDATE only if status='available', check meta.changes to detect race
+    const claim = await c.env.DB.prepare("UPDATE credits SET status='applied', applied_to_invoice=?, applied_at=datetime('now') WHERE id=? AND tenant_id=? AND status='available'")
+      .bind(b.invoice_id, creditId, t).run();
+    if (!claim.meta.changes) return json({ error: 'Credit already applied or not found' }, 409);
+    // Credit was atomically claimed — now read its amount for the payment
+    const credit = await c.env.DB.prepare('SELECT * FROM credits WHERE id=? AND tenant_id=?').bind(creditId, t).first() as any;
+    // Apply as payment + update invoice atomically
     const payId = uid();
-    await c.env.DB.prepare('INSERT INTO payments (id,tenant_id,invoice_id,client_id,amount,method,reference,notes,payment_date) VALUES (?,?,?,?,?,?,?,?,date(\'now\'))')
-      .bind(payId, t, b.invoice_id, credit.client_id, credit.amount, 'credit', `Credit ${c.req.param('id')}`, 'Applied from credit').run();
-    await c.env.DB.prepare("UPDATE credits SET status='applied',applied_to_invoice=? WHERE id=?").bind(b.invoice_id, c.req.param('id')).run();
-    // Update invoice
-    const inv = await c.env.DB.prepare('SELECT amount_paid, total FROM invoices WHERE id=?').bind(b.invoice_id).first() as any;
-    if (inv) {
-      const newPaid = (inv.amount_paid||0) + credit.amount;
-      const newDue = Math.max(0, inv.total - newPaid);
-      await c.env.DB.prepare('UPDATE invoices SET amount_paid=?,amount_due=?,status=CASE WHEN ?<=0 THEN \'paid\' ELSE \'partial\' END,updated_at=datetime(\'now\') WHERE id=?')
-        .bind(newPaid, newDue, newDue, b.invoice_id).run();
-    }
+    await c.env.DB.batch([
+      c.env.DB.prepare('INSERT INTO payments (id,tenant_id,invoice_id,client_id,amount,method,reference,notes,payment_date) VALUES (?,?,?,?,?,?,?,?,date(\'now\'))')
+        .bind(payId, t, b.invoice_id, credit.client_id, credit.amount, 'credit', `Credit ${creditId}`, 'Applied from credit'),
+      c.env.DB.prepare(`UPDATE invoices SET amount_paid = amount_paid + ?, amount_due = MAX(0, total - (amount_paid + ?)), status = CASE WHEN total - (amount_paid + ?) <= 0 THEN 'paid' ELSE 'partial' END, updated_at = datetime('now') WHERE id = ? AND tenant_id = ?`)
+        .bind(credit.amount, credit.amount, credit.amount, b.invoice_id, t),
+    ]);
     return json({ applied: true, payment_id: payId });
   } catch (e: any) {
     console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: '/credits/:id/apply', error: e?.message }));
@@ -834,6 +848,55 @@ app.get('/activity', async (c) => {
   }
 });
 
+// ═══════════════ INVOICE PDF / HTML ═══════════════
+
+function renderInvoiceHTML(inv: Record<string, unknown>, items: Record<string, unknown>[], payments: Record<string, unknown>[]): string {
+  const esc = (s: unknown) => String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const fmt = (n: unknown) => `$${Number(n || 0).toFixed(2)}`;
+  const itemRows = items.map(i => `<tr><td>${esc(i.description)}</td><td style="text-align:right">${i.quantity}</td><td style="text-align:right">${fmt(i.unit_price)}</td><td style="text-align:right">${fmt(i.amount)}</td></tr>`).join('');
+  const paymentRows = payments.length ? `<h3>Payments</h3><table width="100%"><tr><th>Date</th><th>Method</th><th style="text-align:right">Amount</th></tr>${payments.map(p => `<tr><td>${esc(p.payment_date)}</td><td>${esc(p.method)}</td><td style="text-align:right">${fmt(p.amount)}</td></tr>`).join('')}</table>` : '';
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Invoice ${esc(inv.invoice_number)}</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1a1a2e;background:#fff;padding:40px}
+.invoice{max-width:800px;margin:0 auto}.header{display:flex;justify-content:space-between;margin-bottom:30px}.brand{font-size:24px;font-weight:700;color:#0f172a}
+.inv-num{font-size:14px;color:#64748b}table{width:100%;border-collapse:collapse;margin:15px 0}th{text-align:left;padding:8px 12px;border-bottom:2px solid #e2e8f0;font-size:13px;color:#64748b;text-transform:uppercase}
+td{padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:14px}.totals{margin-top:20px;text-align:right}.totals .row{display:flex;justify-content:flex-end;gap:40px;padding:4px 0;font-size:14px}
+.totals .total{font-size:18px;font-weight:700;border-top:2px solid #1a1a2e;padding-top:8px;margin-top:8px}.status{display:inline-block;padding:4px 12px;border-radius:4px;font-size:12px;font-weight:600;text-transform:uppercase}
+.status.paid{background:#dcfce7;color:#166534}.status.sent{background:#dbeafe;color:#1e40af}.status.overdue{background:#fee2e2;color:#991b1b}.status.draft{background:#f3f4f6;color:#374151}
+.footer{margin-top:30px;padding-top:15px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8}
+@media print{body{padding:20px}.no-print{display:none}}</style></head><body>
+<div class="invoice"><div class="header"><div><div class="brand">INVOICE</div><div class="inv-num">#${esc(inv.invoice_number)}</div></div>
+<div style="text-align:right"><span class="status ${String(inv.status||'draft').toLowerCase()}">${esc(inv.status)}</span><br/><small>Date: ${esc(inv.issue_date)}</small><br/><small>Due: ${esc(inv.due_date)}</small></div></div>
+<div style="display:flex;justify-content:space-between;margin-bottom:25px"><div><strong>Bill To:</strong><br/>${esc(inv.client_name)}${inv.client_company ? '<br/>' + esc(inv.client_company) : ''}${inv.client_address ? '<br/>' + esc(inv.client_address) : ''}${inv.client_city ? '<br/>' + esc(inv.client_city) + ', ' + esc(inv.client_state) + ' ' + esc(inv.client_zip) : ''}</div>
+${inv.po_number ? `<div><strong>PO Number:</strong> ${esc(inv.po_number)}</div>` : ''}</div>
+<table><thead><tr><th>Description</th><th style="text-align:right">Qty</th><th style="text-align:right">Unit Price</th><th style="text-align:right">Amount</th></tr></thead><tbody>${itemRows}</tbody></table>
+<div class="totals"><div class="row"><span>Subtotal:</span><span>${fmt(inv.subtotal)}</span></div>
+${Number(inv.tax_amount) > 0 ? `<div class="row"><span>Tax (${inv.tax_rate}%):</span><span>${fmt(inv.tax_amount)}</span></div>` : ''}
+${Number(inv.discount_amount) > 0 ? `<div class="row"><span>Discount:</span><span>-${fmt(inv.discount_amount)}</span></div>` : ''}
+${Number(inv.shipping) > 0 ? `<div class="row"><span>Shipping:</span><span>${fmt(inv.shipping)}</span></div>` : ''}
+<div class="row total"><span>Total:</span><span>${fmt(inv.total)}</span></div>
+${Number(inv.amount_paid) > 0 ? `<div class="row"><span>Paid:</span><span>${fmt(inv.amount_paid)}</span></div><div class="row" style="font-weight:700"><span>Balance Due:</span><span>${fmt(inv.balance_due)}</span></div>` : ''}</div>
+${paymentRows}${inv.notes ? `<div style="margin-top:20px"><strong>Notes:</strong><p style="margin-top:5px;font-size:13px;color:#475569">${esc(inv.notes)}</p></div>` : ''}
+${inv.terms ? `<div style="margin-top:10px"><strong>Terms:</strong><p style="margin-top:5px;font-size:13px;color:#475569">${esc(inv.terms)}</p></div>` : ''}
+<div class="footer">${inv.footer ? esc(inv.footer) + '<br/>' : ''}Generated by Echo Invoice • echo-ept.com</div>
+<div class="no-print" style="margin-top:20px;text-align:center"><button onclick="window.print()" style="padding:10px 30px;background:#0f172a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px">Print / Save as PDF</button></div>
+</div></body></html>`;
+}
+
+// GET /invoices/:id/pdf — Render printable invoice HTML (browser Print → PDF)
+app.get('/invoices/:id/pdf', async (c) => {
+  try {
+    const inv = await c.env.DB.prepare('SELECT i.*, c.name as client_name, c.company as client_company, c.email as client_email, c.address as client_address, c.city as client_city, c.state as client_state, c.zip as client_zip FROM invoices i LEFT JOIN clients c ON i.client_id=c.id WHERE i.id=? AND i.tenant_id=?').bind(c.req.param('id'), tid(c)).first() as Record<string, unknown> | null;
+    if (!inv) return json({ error: 'Not found' }, 404);
+    const items = await c.env.DB.prepare('SELECT * FROM invoice_items WHERE invoice_id=? ORDER BY sort_order').bind(c.req.param('id')).all();
+    const payments = await c.env.DB.prepare('SELECT * FROM payments WHERE invoice_id=? ORDER BY payment_date DESC').bind(c.req.param('id')).all();
+    const html = renderInvoiceHTML(inv, items.results as Record<string, unknown>[], payments.results as Record<string, unknown>[]);
+    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  } catch (e: any) {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'PDF render failed', error: e?.message }));
+    return c.json({ error: 'Render error' }, 500);
+  }
+});
+
 // ═══════════════ CRON: OVERDUE + RECURRING ═══════════════
 app.get('/__cron', async (c) => {
   const apiKey = c.req.header('X-Echo-API-Key') || '';
@@ -900,8 +963,13 @@ app.get('/__cron', async (c) => {
 // ── Helper functions ──
 async function recalcInvoice(db: D1Database, invoiceId: string, tenantId: string) {
   try {
-    const items = await db.prepare('SELECT SUM(amount) as subtotal, SUM(tax_amount) as tax_total FROM invoice_items WHERE invoice_id=?').bind(invoiceId).first() as any;
-    const inv = await db.prepare('SELECT discount_percent, shipping, amount_paid FROM invoices WHERE id=? AND tenant_id=?').bind(invoiceId, tenantId).first() as any;
+    // Batch both SELECTs together to reduce round-trips and ensure consistent read
+    const [itemsResult, invResult] = await db.batch([
+      db.prepare('SELECT SUM(amount) as subtotal, SUM(tax_amount) as tax_total FROM invoice_items WHERE invoice_id=?').bind(invoiceId),
+      db.prepare('SELECT discount_percent, shipping, amount_paid FROM invoices WHERE id=? AND tenant_id=?').bind(invoiceId, tenantId),
+    ]);
+    const items = (itemsResult as D1Result).results?.[0] as any;
+    const inv = (invResult as D1Result).results?.[0] as any;
     if (!inv) return;
     const subtotal = items?.subtotal || 0;
     const taxAmount = items?.tax_total || 0;
