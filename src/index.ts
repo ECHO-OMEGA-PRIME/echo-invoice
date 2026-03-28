@@ -734,74 +734,104 @@ app.get('/reports/aging', async (c) => {
 });
 
 app.get('/reports/profit-loss', async (c) => {
-  const t = tid(c); const from = c.req.query('from') || new Date(Date.now()-90*86400000).toISOString().split('T')[0]; const to = c.req.query('to') || new Date().toISOString().split('T')[0];
-  const [income, expenses] = await Promise.all([
-    c.env.DB.prepare('SELECT SUM(amount) as sum FROM payments WHERE tenant_id=? AND payment_date>=? AND payment_date<=?').bind(t, from, to).first(),
-    c.env.DB.prepare('SELECT SUM(amount) as sum FROM expenses WHERE tenant_id=? AND expense_date>=? AND expense_date<=?').bind(t, from, to).first(),
-  ]);
-  const expByCat = await c.env.DB.prepare('SELECT category, SUM(amount) as total FROM expenses WHERE tenant_id=? AND expense_date>=? AND expense_date<=? GROUP BY category ORDER BY total DESC').bind(t, from, to).all();
-  return json({
-    period: { from, to },
-    income: (income as any)?.sum || 0,
-    expenses: (expenses as any)?.sum || 0,
-    net_profit: ((income as any)?.sum || 0) - ((expenses as any)?.sum || 0),
-    expense_breakdown: expByCat.results,
-  });
+  try {
+    const t = tid(c); const from = c.req.query('from') || new Date(Date.now()-90*86400000).toISOString().split('T')[0]; const to = c.req.query('to') || new Date().toISOString().split('T')[0];
+    const [income, expenses] = await Promise.all([
+      c.env.DB.prepare('SELECT SUM(amount) as sum FROM payments WHERE tenant_id=? AND payment_date>=? AND payment_date<=?').bind(t, from, to).first(),
+      c.env.DB.prepare('SELECT SUM(amount) as sum FROM expenses WHERE tenant_id=? AND expense_date>=? AND expense_date<=?').bind(t, from, to).first(),
+    ]);
+    const expByCat = await c.env.DB.prepare('SELECT category, SUM(amount) as total FROM expenses WHERE tenant_id=? AND expense_date>=? AND expense_date<=? GROUP BY category ORDER BY total DESC').bind(t, from, to).all();
+    return json({
+      period: { from, to },
+      income: (income as any)?.sum || 0,
+      expenses: (expenses as any)?.sum || 0,
+      net_profit: ((income as any)?.sum || 0) - ((expenses as any)?.sum || 0),
+      expense_breakdown: expByCat.results,
+    });
+  } catch (e: any) {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: '/reports/profit-loss', error: e?.message }));
+    return c.json({ error: 'Database error' }, 500);
+  }
 });
 
 app.get('/reports/revenue-by-client', async (c) => {
-  const t = tid(c);
-  const r = await c.env.DB.prepare("SELECT c.id, c.name, c.company, COUNT(i.id) as invoice_count, SUM(i.total) as total_invoiced, SUM(i.amount_paid) as total_paid, SUM(i.amount_due) as total_outstanding FROM clients c LEFT JOIN invoices i ON c.id=i.client_id AND i.status!='void' WHERE c.tenant_id=? GROUP BY c.id ORDER BY total_invoiced DESC LIMIT 50").bind(t).all();
-  return json(r.results);
+  try {
+    const t = tid(c);
+    const r = await c.env.DB.prepare("SELECT c.id, c.name, c.company, COUNT(i.id) as invoice_count, SUM(i.total) as total_invoiced, SUM(i.amount_paid) as total_paid, SUM(i.amount_due) as total_outstanding FROM clients c LEFT JOIN invoices i ON c.id=i.client_id AND i.status!='void' WHERE c.tenant_id=? GROUP BY c.id ORDER BY total_invoiced DESC LIMIT 50").bind(t).all();
+    return json(r.results);
+  } catch (e: any) {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: '/reports/revenue-by-client', error: e?.message }));
+    return c.json({ error: 'Database error' }, 500);
+  }
 });
 
 app.get('/reports/monthly-revenue', async (c) => {
-  const t = tid(c);
-  const r = await c.env.DB.prepare("SELECT strftime('%Y-%m', payment_date) as month, SUM(amount) as revenue, COUNT(*) as payment_count FROM payments WHERE tenant_id=? AND payment_date>=date('now','-12 months') GROUP BY month ORDER BY month").bind(t).all();
-  return json(r.results);
+  try {
+    const t = tid(c);
+    const r = await c.env.DB.prepare("SELECT strftime('%Y-%m', payment_date) as month, SUM(amount) as revenue, COUNT(*) as payment_count FROM payments WHERE tenant_id=? AND payment_date>=date('now','-12 months') GROUP BY month ORDER BY month").bind(t).all();
+    return json(r.results);
+  } catch (e: any) {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: '/reports/monthly-revenue', error: e?.message }));
+    return c.json({ error: 'Database error' }, 500);
+  }
 });
 
 // ═══════════════ AI FEATURES ═══════════════
 app.post('/ai/late-payment-risk', async (c) => {
-  const t = tid(c); const b = await c.req.json();
-  // Gather client payment history
-  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id=? AND tenant_id=?').bind(b.client_id, t).first() as any;
-  if (!client) return json({ error: 'Client not found' }, 404);
-  const history = await c.env.DB.prepare("SELECT invoice_number, total, amount_due, status, issue_date, due_date, paid_date, julianday(paid_date)-julianday(due_date) as days_late FROM invoices WHERE client_id=? AND tenant_id=? AND status IN ('paid','partial','overdue') ORDER BY issue_date DESC LIMIT 20").bind(b.client_id, t).all();
   try {
-    const aiRes = await c.env.ENGINE_RUNTIME.fetch('https://engine/query', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ engine_id: 'FN-01', query: `Analyze late payment risk for client: ${client.name}. Avg days to pay: ${client.avg_days_to_pay || 'unknown'}. Total outstanding: $${client.total_outstanding}. Payment history: ${JSON.stringify(history.results?.slice(0,10))}. Provide risk score (1-10), probability of late payment, and recommended action.` }),
-    });
-    const ai = await aiRes.json() as any;
-    return json({ client_name: client.name, analysis: ai.response || ai });
-  } catch { return json({ client_name: client.name, analysis: 'AI unavailable', avg_days_to_pay: client.avg_days_to_pay, total_outstanding: client.total_outstanding }); }
+    const t = tid(c); const b = await c.req.json();
+    // Gather client payment history
+    const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id=? AND tenant_id=?').bind(b.client_id, t).first() as any;
+    if (!client) return json({ error: 'Client not found' }, 404);
+    const history = await c.env.DB.prepare("SELECT invoice_number, total, amount_due, status, issue_date, due_date, paid_date, julianday(paid_date)-julianday(due_date) as days_late FROM invoices WHERE client_id=? AND tenant_id=? AND status IN ('paid','partial','overdue') ORDER BY issue_date DESC LIMIT 20").bind(b.client_id, t).all();
+    try {
+      const aiRes = await c.env.ENGINE_RUNTIME.fetch('https://engine/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ engine_id: 'FN-01', query: `Analyze late payment risk for client: ${client.name}. Avg days to pay: ${client.avg_days_to_pay || 'unknown'}. Total outstanding: $${client.total_outstanding}. Payment history: ${JSON.stringify(history.results?.slice(0,10))}. Provide risk score (1-10), probability of late payment, and recommended action.` }),
+      });
+      const ai = await aiRes.json() as any;
+      return json({ client_name: client.name, analysis: ai.response || ai });
+    } catch { return json({ client_name: client.name, analysis: 'AI unavailable', avg_days_to_pay: client.avg_days_to_pay, total_outstanding: client.total_outstanding }); }
+  } catch (e: any) {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: '/ai/late-payment-risk', error: e?.message }));
+    return c.json({ error: 'Database error' }, 500);
+  }
 });
 
 app.post('/ai/invoice-optimization', async (c) => {
-  const t = tid(c);
-  const stats = await c.env.DB.prepare("SELECT AVG(julianday(paid_date)-julianday(issue_date)) as avg_days_to_pay, AVG(julianday(paid_date)-julianday(due_date)) as avg_days_past_due, COUNT(CASE WHEN julianday(paid_date)>julianday(due_date) THEN 1 END)*100.0/COUNT(*) as late_pct FROM invoices WHERE tenant_id=? AND status='paid' AND paid_date IS NOT NULL").bind(t).first();
   try {
-    const aiRes = await c.env.ENGINE_RUNTIME.fetch('https://engine/query', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ engine_id: 'FN-01', query: `Analyze invoicing patterns and suggest optimizations. Stats: avg days to pay: ${(stats as any)?.avg_days_to_pay?.toFixed(1)}, late payment rate: ${(stats as any)?.late_pct?.toFixed(1)}%, avg days past due: ${(stats as any)?.avg_days_past_due?.toFixed(1)}. Suggest: optimal payment terms, early payment discount strategy, reminder timing, and invoice wording improvements.` }),
-    });
-    const ai = await aiRes.json() as any;
-    return json({ stats, recommendations: ai.response || ai });
-  } catch { return json({ stats, recommendations: 'AI unavailable' }); }
+    const t = tid(c);
+    const stats = await c.env.DB.prepare("SELECT AVG(julianday(paid_date)-julianday(issue_date)) as avg_days_to_pay, AVG(julianday(paid_date)-julianday(due_date)) as avg_days_past_due, COUNT(CASE WHEN julianday(paid_date)>julianday(due_date) THEN 1 END)*100.0/COUNT(*) as late_pct FROM invoices WHERE tenant_id=? AND status='paid' AND paid_date IS NOT NULL").bind(t).first();
+    try {
+      const aiRes = await c.env.ENGINE_RUNTIME.fetch('https://engine/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ engine_id: 'FN-01', query: `Analyze invoicing patterns and suggest optimizations. Stats: avg days to pay: ${(stats as any)?.avg_days_to_pay?.toFixed(1)}, late payment rate: ${(stats as any)?.late_pct?.toFixed(1)}%, avg days past due: ${(stats as any)?.avg_days_past_due?.toFixed(1)}. Suggest: optimal payment terms, early payment discount strategy, reminder timing, and invoice wording improvements.` }),
+      });
+      const ai = await aiRes.json() as any;
+      return json({ stats, recommendations: ai.response || ai });
+    } catch { return json({ stats, recommendations: 'AI unavailable' }); }
+  } catch (e: any) {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: '/ai/invoice-optimization', error: e?.message }));
+    return c.json({ error: 'Database error' }, 500);
+  }
 });
 
 // ═══════════════ ACTIVITY LOG ═══════════════
 app.get('/activity', async (c) => {
-  const t = tid(c); const entity = c.req.query('entity_type'); const eid = c.req.query('entity_id');
-  let q = 'SELECT * FROM activity_log WHERE tenant_id=?'; const params: string[] = [t];
-  if (entity) { q += ' AND entity_type=?'; params.push(entity); }
-  if (eid) { q += ' AND entity_id=?'; params.push(eid); }
-  q += ' ORDER BY created_at DESC LIMIT 100';
-  const r = await c.env.DB.prepare(q).bind(...params).all();
-  return json(r.results);
+  try {
+    const t = tid(c); const entity = c.req.query('entity_type'); const eid = c.req.query('entity_id');
+    let q = 'SELECT * FROM activity_log WHERE tenant_id=?'; const params: string[] = [t];
+    if (entity) { q += ' AND entity_type=?'; params.push(entity); }
+    if (eid) { q += ' AND entity_id=?'; params.push(eid); }
+    q += ' ORDER BY created_at DESC LIMIT 100';
+    const r = await c.env.DB.prepare(q).bind(...params).all();
+    return json(r.results);
+  } catch (e: any) {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: '/activity', error: e?.message }));
+    return c.json({ error: 'Database error' }, 500);
+  }
 });
 
 // ═══════════════ CRON: OVERDUE + RECURRING ═══════════════
@@ -812,79 +842,99 @@ app.get('/__cron', async (c) => {
   if (!expected || (apiKey !== expected && bearer !== expected)) {
     return json({ error: 'Unauthorized' }, 401);
   }
-  const results: string[] = [];
-  // Mark overdue invoices
-  const overdue = await c.env.DB.prepare("UPDATE invoices SET status='overdue',updated_at=datetime('now') WHERE status IN ('sent','partial') AND due_date<date('now')").run();
-  results.push(`Marked ${overdue.meta.changes} invoices overdue`);
+  try {
+    const results: string[] = [];
+    // Mark overdue invoices
+    const overdue = await c.env.DB.prepare("UPDATE invoices SET status='overdue',updated_at=datetime('now') WHERE status IN ('sent','partial') AND due_date<date('now')").run();
+    results.push(`Marked ${overdue.meta.changes} invoices overdue`);
 
-  // Generate recurring invoices
-  const recurrings = await c.env.DB.prepare("SELECT * FROM recurring_invoices WHERE status='active' AND next_date<=date('now')").bind().all();
-  for (const rec of recurrings.results as any[]) {
-    const tenant = await c.env.DB.prepare('SELECT invoice_prefix, next_invoice_number, payment_terms_days FROM tenants WHERE id=?').bind(rec.tenant_id).first() as any;
-    if (!tenant) continue;
-    const invoiceNumber = `${tenant.invoice_prefix}-${String(tenant.next_invoice_number).padStart(5, '0')}`;
-    const invId = uid();
-    const today = new Date().toISOString().split('T')[0];
-    const dueDate = new Date(Date.now() + (tenant.payment_terms_days||30)*86400000).toISOString().split('T')[0];
-    const items = JSON.parse(rec.items_json || '[]');
-    let subtotal = 0;
-    await c.env.DB.prepare(`INSERT INTO invoices (id,tenant_id,client_id,invoice_number,status,issue_date,due_date,subtotal,tax_rate,total,amount_due,is_recurring,recurring_id) VALUES (?,?,?,?,'draft',?,?,0,?,0,0,1,?)`)
-      .bind(invId, rec.tenant_id, rec.client_id, invoiceNumber, today, dueDate, rec.tax_rate||0, rec.id).run();
-    let totalTax = 0;
-    for (const item of items) {
-      const amount = (item.quantity||1) * (item.unit_price||0);
-      const itemTaxRate = item.tax_rate ?? rec.tax_rate ?? 0;
-      const itemTaxAmt = amount * (itemTaxRate / 100);
-      subtotal += amount;
-      totalTax += itemTaxAmt;
-      await c.env.DB.prepare('INSERT INTO invoice_items (id,invoice_id,tenant_id,description,quantity,unit_price,amount,tax_rate,tax_amount) VALUES (?,?,?,?,?,?,?,?,?)')
-        .bind(uid(), invId, rec.tenant_id, item.description, item.quantity||1, item.unit_price||0, amount, itemTaxRate, itemTaxAmt).run();
+    // Generate recurring invoices
+    const recurrings = await c.env.DB.prepare("SELECT * FROM recurring_invoices WHERE status='active' AND next_date<=date('now')").bind().all();
+    for (const rec of recurrings.results as any[]) {
+      const tenant = await c.env.DB.prepare('SELECT invoice_prefix, next_invoice_number, payment_terms_days FROM tenants WHERE id=?').bind(rec.tenant_id).first() as any;
+      if (!tenant) continue;
+      const invoiceNumber = `${tenant.invoice_prefix}-${String(tenant.next_invoice_number).padStart(5, '0')}`;
+      const invId = uid();
+      const today = new Date().toISOString().split('T')[0];
+      const dueDate = new Date(Date.now() + (tenant.payment_terms_days||30)*86400000).toISOString().split('T')[0];
+      const items = JSON.parse(rec.items_json || '[]');
+      let subtotal = 0;
+      await c.env.DB.prepare(`INSERT INTO invoices (id,tenant_id,client_id,invoice_number,status,issue_date,due_date,subtotal,tax_rate,total,amount_due,is_recurring,recurring_id) VALUES (?,?,?,?,'draft',?,?,0,?,0,0,1,?)`)
+        .bind(invId, rec.tenant_id, rec.client_id, invoiceNumber, today, dueDate, rec.tax_rate||0, rec.id).run();
+      let totalTax = 0;
+      for (const item of items) {
+        const amount = (item.quantity||1) * (item.unit_price||0);
+        const itemTaxRate = item.tax_rate ?? rec.tax_rate ?? 0;
+        const itemTaxAmt = amount * (itemTaxRate / 100);
+        subtotal += amount;
+        totalTax += itemTaxAmt;
+        await c.env.DB.prepare('INSERT INTO invoice_items (id,invoice_id,tenant_id,description,quantity,unit_price,amount,tax_rate,tax_amount) VALUES (?,?,?,?,?,?,?,?,?)')
+          .bind(uid(), invId, rec.tenant_id, item.description, item.quantity||1, item.unit_price||0, amount, itemTaxRate, itemTaxAmt).run();
+      }
+      const total = subtotal + totalTax;
+      await c.env.DB.prepare('UPDATE invoices SET subtotal=?,tax_amount=?,total=?,amount_due=? WHERE id=?').bind(subtotal, totalTax, total, total, invId).run();
+      // Advance next_date
+      const nextDate = advanceDate(rec.next_date, rec.frequency, rec.interval_value||1);
+      const newStatus = rec.end_date && nextDate > rec.end_date ? 'completed' : 'active';
+      await c.env.DB.prepare('UPDATE recurring_invoices SET next_date=?,status=?,invoices_generated=invoices_generated+1,last_generated_at=datetime(\'now\'),updated_at=datetime(\'now\') WHERE id=?')
+        .bind(nextDate, newStatus, rec.id).run();
+      await c.env.DB.prepare('UPDATE tenants SET next_invoice_number=next_invoice_number+1 WHERE id=?').bind(rec.tenant_id).run();
+      results.push(`Generated recurring invoice ${invoiceNumber} for ${rec.client_id}`);
     }
-    const total = subtotal + totalTax;
-    await c.env.DB.prepare('UPDATE invoices SET subtotal=?,tax_amount=?,total=?,amount_due=? WHERE id=?').bind(subtotal, totalTax, total, total, invId).run();
-    // Advance next_date
-    const nextDate = advanceDate(rec.next_date, rec.frequency, rec.interval_value||1);
-    const newStatus = rec.end_date && nextDate > rec.end_date ? 'completed' : 'active';
-    await c.env.DB.prepare('UPDATE recurring_invoices SET next_date=?,status=?,invoices_generated=invoices_generated+1,last_generated_at=datetime(\'now\'),updated_at=datetime(\'now\') WHERE id=?')
-      .bind(nextDate, newStatus, rec.id).run();
-    await c.env.DB.prepare('UPDATE tenants SET next_invoice_number=next_invoice_number+1 WHERE id=?').bind(rec.tenant_id).run();
-    results.push(`Generated recurring invoice ${invoiceNumber} for ${rec.client_id}`);
-  }
 
-  // Apply late fees
-  const lateFeeInvoices = await c.env.DB.prepare("SELECT i.id, i.tenant_id, i.amount_due, t.late_fee_percent FROM invoices i JOIN tenants t ON i.tenant_id=t.id WHERE i.status='overdue' AND i.late_fee_applied=0 AND t.late_fee_percent>0 AND i.due_date<date('now','-7 days')").bind().all();
-  for (const inv of lateFeeInvoices.results as any[]) {
-    const fee = inv.amount_due * (inv.late_fee_percent / 100);
-    await c.env.DB.prepare('UPDATE invoices SET late_fee_applied=?,total=total+?,amount_due=amount_due+?,updated_at=datetime(\'now\') WHERE id=?').bind(fee, fee, fee, inv.id).run();
-    results.push(`Applied $${fee.toFixed(2)} late fee to invoice ${inv.id}`);
-  }
+    // Apply late fees
+    const lateFeeInvoices = await c.env.DB.prepare("SELECT i.id, i.tenant_id, i.amount_due, t.late_fee_percent FROM invoices i JOIN tenants t ON i.tenant_id=t.id WHERE i.status='overdue' AND i.late_fee_applied=0 AND t.late_fee_percent>0 AND i.due_date<date('now','-7 days')").bind().all();
+    for (const inv of lateFeeInvoices.results as any[]) {
+      const fee = inv.amount_due * (inv.late_fee_percent / 100);
+      await c.env.DB.prepare('UPDATE invoices SET late_fee_applied=?,total=total+?,amount_due=amount_due+?,updated_at=datetime(\'now\') WHERE id=?').bind(fee, fee, fee, inv.id).run();
+      results.push(`Applied $${fee.toFixed(2)} late fee to invoice ${inv.id}`);
+    }
 
-  return json({ cron: 'complete', results });
+    return json({ cron: 'complete', results });
+  } catch (e: any) {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: '/__cron', error: e?.message }));
+    return c.json({ error: 'Database error' }, 500);
+  }
 });
 
 // ── Helper functions ──
 async function recalcInvoice(db: D1Database, invoiceId: string, tenantId: string) {
-  const items = await db.prepare('SELECT SUM(amount) as subtotal, SUM(tax_amount) as tax_total FROM invoice_items WHERE invoice_id=?').bind(invoiceId).first() as any;
-  const inv = await db.prepare('SELECT discount_percent, shipping, amount_paid FROM invoices WHERE id=? AND tenant_id=?').bind(invoiceId, tenantId).first() as any;
-  if (!inv) return;
-  const subtotal = items?.subtotal || 0;
-  const taxAmount = items?.tax_total || 0;
-  const discountAmount = subtotal * ((inv.discount_percent||0) / 100);
-  const total = subtotal + taxAmount - discountAmount + (inv.shipping||0);
-  const amountDue = Math.max(0, total - (inv.amount_paid||0));
-  await db.prepare('UPDATE invoices SET subtotal=?,tax_amount=?,discount_amount=?,total=?,amount_due=?,updated_at=datetime(\'now\') WHERE id=?')
-    .bind(subtotal, taxAmount, discountAmount, total, amountDue, invoiceId).run();
+  try {
+    const items = await db.prepare('SELECT SUM(amount) as subtotal, SUM(tax_amount) as tax_total FROM invoice_items WHERE invoice_id=?').bind(invoiceId).first() as any;
+    const inv = await db.prepare('SELECT discount_percent, shipping, amount_paid FROM invoices WHERE id=? AND tenant_id=?').bind(invoiceId, tenantId).first() as any;
+    if (!inv) return;
+    const subtotal = items?.subtotal || 0;
+    const taxAmount = items?.tax_total || 0;
+    const discountAmount = subtotal * ((inv.discount_percent||0) / 100);
+    const total = subtotal + taxAmount - discountAmount + (inv.shipping||0);
+    const amountDue = Math.max(0, total - (inv.amount_paid||0));
+    await db.prepare('UPDATE invoices SET subtotal=?,tax_amount=?,discount_amount=?,total=?,amount_due=?,updated_at=datetime(\'now\') WHERE id=?')
+      .bind(subtotal, taxAmount, discountAmount, total, amountDue, invoiceId).run();
+  } catch (e: any) {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: 'recalcInvoice', error: e?.message }));
+    throw e;
+  }
 }
 
 async function updateClientTotals(db: D1Database, tenantId: string, clientId: string) {
-  const stats = await db.prepare("SELECT SUM(total) as invoiced, SUM(amount_paid) as paid, SUM(amount_due) as outstanding, AVG(CASE WHEN paid_date IS NOT NULL THEN julianday(paid_date)-julianday(issue_date) END) as avg_days FROM invoices WHERE client_id=? AND tenant_id=? AND status!='void'").bind(clientId, tenantId).first() as any;
-  await db.prepare('UPDATE clients SET total_invoiced=?,total_paid=?,total_outstanding=?,avg_days_to_pay=?,last_payment_at=datetime(\'now\'),updated_at=datetime(\'now\') WHERE id=? AND tenant_id=?')
-    .bind(stats?.invoiced||0, stats?.paid||0, stats?.outstanding||0, stats?.avg_days||null, clientId, tenantId).run();
+  try {
+    const stats = await db.prepare("SELECT SUM(total) as invoiced, SUM(amount_paid) as paid, SUM(amount_due) as outstanding, AVG(CASE WHEN paid_date IS NOT NULL THEN julianday(paid_date)-julianday(issue_date) END) as avg_days FROM invoices WHERE client_id=? AND tenant_id=? AND status!='void'").bind(clientId, tenantId).first() as any;
+    await db.prepare('UPDATE clients SET total_invoiced=?,total_paid=?,total_outstanding=?,avg_days_to_pay=?,last_payment_at=datetime(\'now\'),updated_at=datetime(\'now\') WHERE id=? AND tenant_id=?')
+      .bind(stats?.invoiced||0, stats?.paid||0, stats?.outstanding||0, stats?.avg_days||null, clientId, tenantId).run();
+  } catch (e: any) {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: 'updateClientTotals', error: e?.message }));
+    throw e;
+  }
 }
 
 async function logActivity(db: D1Database, tenantId: string, entityType: string, entityId: string, action: string, details: string) {
-  await db.prepare('INSERT INTO activity_log (id,tenant_id,entity_type,entity_id,action,details,created_at) VALUES (?,?,?,?,?,?,datetime(\'now\'))')
-    .bind(uid(), tenantId, entityType, entityId, action, details).run();
+  try {
+    await db.prepare('INSERT INTO activity_log (id,tenant_id,entity_type,entity_id,action,details,created_at) VALUES (?,?,?,?,?,?,datetime(\'now\'))')
+      .bind(uid(), tenantId, entityType, entityId, action, details).run();
+  } catch (e: any) {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: 'logActivity', error: e?.message }));
+    throw e;
+  }
 }
 
 function advanceDate(dateStr: string, frequency: string, interval: number): string {
@@ -921,38 +971,42 @@ export default {
     app2.get('/__cron', app.fetch);
     ctx.waitUntil(fetch(new Request('https://dummy/__cron'), { headers: {} }).catch(() => {}));
     // Direct cron execution
-    const results: string[] = [];
-    const overdue = await env.DB.prepare("UPDATE invoices SET status='overdue',updated_at=datetime('now') WHERE status IN ('sent','partial') AND due_date<date('now')").run();
-    results.push(`Marked ${overdue.meta.changes} invoices overdue`);
-    // Generate recurring
-    const recs = await env.DB.prepare("SELECT * FROM recurring_invoices WHERE status='active' AND next_date<=date('now')").all();
-    for (const rec of recs.results as any[]) {
-      const tenant = await env.DB.prepare('SELECT invoice_prefix, next_invoice_number, payment_terms_days FROM tenants WHERE id=?').bind(rec.tenant_id).first() as any;
-      if (!tenant) continue;
-      const invNum = `${tenant.invoice_prefix}-${String(tenant.next_invoice_number).padStart(5, '0')}`;
-      const invId = uid();
-      const today = new Date().toISOString().split('T')[0];
-      const due = new Date(Date.now() + (tenant.payment_terms_days||30)*86400000).toISOString().split('T')[0];
-      const items = JSON.parse(rec.items_json || '[]');
-      let sub = 0;
-      await env.DB.prepare(`INSERT INTO invoices (id,tenant_id,client_id,invoice_number,status,issue_date,due_date,subtotal,tax_rate,total,amount_due,is_recurring,recurring_id) VALUES (?,?,?,?,'draft',?,?,0,?,0,0,1,?)`)
-        .bind(invId, rec.tenant_id, rec.client_id, invNum, today, due, rec.tax_rate||0, rec.id).run();
-      let subTax = 0;
-      for (const it of items) {
-        const amt = (it.quantity||1)*(it.unit_price||0);
-        const itTaxRate = it.tax_rate ?? rec.tax_rate ?? 0;
-        const itTaxAmt = amt * (itTaxRate / 100);
-        sub += amt; subTax += itTaxAmt;
-        await env.DB.prepare('INSERT INTO invoice_items (id,invoice_id,tenant_id,description,quantity,unit_price,amount,tax_rate,tax_amount) VALUES (?,?,?,?,?,?,?,?,?)')
-          .bind(uid(), invId, rec.tenant_id, it.description, it.quantity||1, it.unit_price||0, amt, itTaxRate, itTaxAmt).run();
+    try {
+      const results: string[] = [];
+      const overdue = await env.DB.prepare("UPDATE invoices SET status='overdue',updated_at=datetime('now') WHERE status IN ('sent','partial') AND due_date<date('now')").run();
+      results.push(`Marked ${overdue.meta.changes} invoices overdue`);
+      // Generate recurring
+      const recs = await env.DB.prepare("SELECT * FROM recurring_invoices WHERE status='active' AND next_date<=date('now')").all();
+      for (const rec of recs.results as any[]) {
+        const tenant = await env.DB.prepare('SELECT invoice_prefix, next_invoice_number, payment_terms_days FROM tenants WHERE id=?').bind(rec.tenant_id).first() as any;
+        if (!tenant) continue;
+        const invNum = `${tenant.invoice_prefix}-${String(tenant.next_invoice_number).padStart(5, '0')}`;
+        const invId = uid();
+        const today = new Date().toISOString().split('T')[0];
+        const due = new Date(Date.now() + (tenant.payment_terms_days||30)*86400000).toISOString().split('T')[0];
+        const items = JSON.parse(rec.items_json || '[]');
+        let sub = 0;
+        await env.DB.prepare(`INSERT INTO invoices (id,tenant_id,client_id,invoice_number,status,issue_date,due_date,subtotal,tax_rate,total,amount_due,is_recurring,recurring_id) VALUES (?,?,?,?,'draft',?,?,0,?,0,0,1,?)`)
+          .bind(invId, rec.tenant_id, rec.client_id, invNum, today, due, rec.tax_rate||0, rec.id).run();
+        let subTax = 0;
+        for (const it of items) {
+          const amt = (it.quantity||1)*(it.unit_price||0);
+          const itTaxRate = it.tax_rate ?? rec.tax_rate ?? 0;
+          const itTaxAmt = amt * (itTaxRate / 100);
+          sub += amt; subTax += itTaxAmt;
+          await env.DB.prepare('INSERT INTO invoice_items (id,invoice_id,tenant_id,description,quantity,unit_price,amount,tax_rate,tax_amount) VALUES (?,?,?,?,?,?,?,?,?)')
+            .bind(uid(), invId, rec.tenant_id, it.description, it.quantity||1, it.unit_price||0, amt, itTaxRate, itTaxAmt).run();
+        }
+        const tot = sub+subTax;
+        await env.DB.prepare('UPDATE invoices SET subtotal=?,tax_amount=?,total=?,amount_due=? WHERE id=?').bind(sub,subTax,tot,tot,invId).run();
+        const next = advanceDate(rec.next_date, rec.frequency, rec.interval_value||1);
+        await env.DB.prepare("UPDATE recurring_invoices SET next_date=?,status=CASE WHEN ?!='' AND ?>? THEN 'completed' ELSE 'active' END,invoices_generated=invoices_generated+1,last_generated_at=datetime('now') WHERE id=?")
+          .bind(next, rec.end_date||'', next, rec.end_date||'9999-12-31', rec.id).run();
+        await env.DB.prepare('UPDATE tenants SET next_invoice_number=next_invoice_number+1 WHERE id=?').bind(rec.tenant_id).run();
       }
-      const tot = sub+subTax;
-      await env.DB.prepare('UPDATE invoices SET subtotal=?,tax_amount=?,total=?,amount_due=? WHERE id=?').bind(sub,subTax,tot,tot,invId).run();
-      const next = advanceDate(rec.next_date, rec.frequency, rec.interval_value||1);
-      await env.DB.prepare("UPDATE recurring_invoices SET next_date=?,status=CASE WHEN ?!='' AND ?>? THEN 'completed' ELSE 'active' END,invoices_generated=invoices_generated+1,last_generated_at=datetime('now') WHERE id=?")
-        .bind(next, rec.end_date||'', next, rec.end_date||'9999-12-31', rec.id).run();
-      await env.DB.prepare('UPDATE tenants SET next_invoice_number=next_invoice_number+1 WHERE id=?').bind(rec.tenant_id).run();
+      console.log(JSON.stringify({ event: 'cron', results }));
+    } catch (e: any) {
+      console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: 'scheduled', error: e?.message }));
     }
-    console.log(JSON.stringify({ event: 'cron', results }));
   },
 };
