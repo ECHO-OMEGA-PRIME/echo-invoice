@@ -25,3 +25,7 @@ service = "echo-shared-brain"
 [[services]]
 binding = "EMAIL_SENDER"
 service = "echo-email-sender"
+
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "echo_metrics"
