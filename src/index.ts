@@ -86,7 +86,7 @@ app.use('*', async (c, next) => {
 });
 
 // ── Health ──
-app.get('/', (c) => c.redirect('/health'));
+app.get('/', (c) => c.json({ service: 'echo-invoice', version: '1.0.0', status: 'operational' }));
 app.get('/health', (c) => json({ status: 'ok', service: 'echo-invoice', version: '1.1.0', time: new Date().toISOString() }));
 
 // ═══════════════ TENANTS ═══════════════
