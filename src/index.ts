@@ -28,7 +28,7 @@ app.use('*', async (c, next) => {
   c.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
   c.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
 });
-app.use('*', cors({ origin: '*', allowMethods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'], allowHeaders: ['Content-Type','Authorization','X-Tenant-ID','X-Echo-API-Key'] }));
+app.use('*', cors({ origin: ['https://echo-ept.com','https://www.echo-ept.com','https://echo-op.com','https://www.echo-op.com','http://localhost:3000','http://localhost:3001'], allowMethods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'], allowHeaders: ['Content-Type','Authorization','X-Tenant-ID','X-Echo-API-Key'] }));
 
 // ── Helpers ──
 const uid = () => crypto.randomUUID();
@@ -473,7 +473,8 @@ app.get('/payments', async (c) => {
 app.post('/payments', async (c) => {
   try {
     const t = tid(c); const b = sanitizeBody(await c.req.json()); const id = uid();
-    const paymentAmount = b.amount as number;
+    const paymentAmount = Number(b.amount);
+    if (!paymentAmount || paymentAmount <= 0 || paymentAmount > 10_000_000 || !Number.isFinite(paymentAmount)) return json({ error: 'amount must be a positive number up to 10,000,000' }, 400);
     const paymentDate = (b.payment_date as string) || new Date().toISOString().split('T')[0];
     // Atomic batch: INSERT payment + UPDATE invoice totals in one transaction
     // Uses atomic SQL arithmetic to prevent double-pay race condition
@@ -634,8 +635,10 @@ app.get('/expenses', async (c) => {
 app.post('/expenses', async (c) => {
   try {
     const t = tid(c); const b = sanitizeBody(await c.req.json()); const id = uid();
+    const amt = Number(b.amount); if (!amt || amt <= 0 || amt > 10_000_000 || !Number.isFinite(amt)) return json({ error: 'amount must be a positive number up to 10,000,000' }, 400);
+    const taxAmt = Number(b.tax_amount || 0); if (taxAmt < 0 || taxAmt > 10_000_000 || !Number.isFinite(taxAmt)) return json({ error: 'invalid tax_amount' }, 400);
     await c.env.DB.prepare('INSERT INTO expenses (id,tenant_id,category,vendor,description,amount,tax_amount,currency,expense_date,receipt_url,is_billable,client_id,payment_method,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-      .bind(id, t, b.category, b.vendor||null, b.description||null, b.amount, b.tax_amount||0, b.currency||'USD', b.expense_date||new Date().toISOString().split('T')[0], b.receipt_url||null, b.is_billable||0, b.client_id||null, b.payment_method||null, b.notes||null).run();
+      .bind(id, t, b.category, b.vendor||null, b.description||null, amt, taxAmt, b.currency||'USD', b.expense_date||new Date().toISOString().split('T')[0], b.receipt_url||null, b.is_billable||0, b.client_id||null, b.payment_method||null, b.notes||null).run();
     return json({ id }, 201);
   } catch (e: any) {
     console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: '/expenses', error: e?.message }));
@@ -667,8 +670,9 @@ app.get('/credits', async (c) => {
 app.post('/credits', async (c) => {
   try {
     const t = tid(c); const b = sanitizeBody(await c.req.json()); const id = uid();
+    const creditAmt = Number(b.amount); if (!creditAmt || creditAmt <= 0 || creditAmt > 10_000_000 || !Number.isFinite(creditAmt)) return json({ error: 'amount must be a positive number up to 10,000,000' }, 400);
     await c.env.DB.prepare('INSERT INTO credits (id,tenant_id,client_id,amount,reason) VALUES (?,?,?,?,?)')
-      .bind(id, t, b.client_id, b.amount, b.reason||null).run();
+      .bind(id, t, b.client_id, creditAmt, b.reason||null).run();
     return json({ id }, 201);
   } catch (e: any) {
     console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', message: 'D1 query failed', endpoint: '/credits', error: e?.message }));
@@ -1042,14 +1046,37 @@ app.notFound((c) => {
 export default {
   fetch: app.fetch,
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    const app2 = new Hono<{ Bindings: Env }>();
-    app2.get('/__cron', app.fetch);
-    ctx.waitUntil(fetch(new Request('https://dummy/__cron'), { headers: {} }).catch(() => {}));
     // Direct cron execution
     try {
       const results: string[] = [];
+      // Get invoices about to become overdue (for email notification)
+      const aboutToOverdue = await env.DB.prepare(
+        "SELECT i.id, i.invoice_number, i.total, i.amount_due, i.due_date, c.name as client_name, c.email as client_email, i.tenant_id FROM invoices i LEFT JOIN clients c ON i.client_id=c.id WHERE i.status IN ('sent','partial') AND i.due_date<date('now')"
+      ).all();
       const overdue = await env.DB.prepare("UPDATE invoices SET status='overdue',updated_at=datetime('now') WHERE status IN ('sent','partial') AND due_date<date('now')").run();
       results.push(`Marked ${overdue.meta.changes} invoices overdue`);
+      // Send overdue notification emails
+      if (env.EMAIL_SENDER && aboutToOverdue.results?.length) {
+        for (const inv of aboutToOverdue.results as any[]) {
+          if (!inv.client_email) continue;
+          const daysLate = Math.floor((Date.now() - new Date(inv.due_date).getTime()) / 86400000);
+          try {
+            await env.EMAIL_SENDER.fetch('https://email/send', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                to: inv.client_email,
+                subject: `Payment Reminder: Invoice ${inv.invoice_number} is overdue`,
+                html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto"><h2 style="color:#e53e3e">Payment Reminder</h2><p>Dear ${inv.client_name || 'Valued Client'},</p><p>Invoice <strong>${inv.invoice_number}</strong> was due on <strong>${inv.due_date}</strong> (${daysLate} day${daysLate!==1?'s':''} ago).</p><p><strong>Amount Due: $${(inv.amount_due||0).toFixed(2)}</strong></p><p>Please arrange payment at your earliest convenience.</p><p>Thank you for your business.</p></div>`,
+                from_name: 'Echo Invoice',
+              }),
+            });
+          } catch (e) {
+            console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', worker: 'echo-invoice', msg: 'Overdue email failed', invoice: inv.invoice_number, error: String(e) }));
+          }
+        }
+        results.push(`Sent ${aboutToOverdue.results.length} overdue reminders`);
+      }
       // Generate recurring
       const recs = await env.DB.prepare("SELECT * FROM recurring_invoices WHERE status='active' AND next_date<=date('now')").all();
       for (const rec of recs.results as any[]) {
