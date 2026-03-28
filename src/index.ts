@@ -679,6 +679,19 @@ function advanceDate(dateStr: string, frequency: string, interval: number): stri
   return d.toISOString().split('T')[0];
 }
 
+// ── Error handlers ──
+app.onError((err, c) => {
+  if (err.message?.includes('JSON')) {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+  console.error(`[echo-invoice] ${err.message}`);
+  return c.json({ error: 'Internal server error' }, 500);
+});
+
+app.notFound((c) => {
+  return c.json({ error: 'Not found' }, 404);
+});
+
 // ── Scheduled handler ──
 export default {
   fetch: app.fetch,
