@@ -2,3 +2,9 @@ node_modules/
 .wrangler/
 dist/
 .dev.vars
+.env
+.mypy_cache/
+.pytest_cache/
+.venv/
+__pycache__/
+*.py[cod]
