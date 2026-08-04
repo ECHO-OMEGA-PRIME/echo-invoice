@@ -85,11 +85,22 @@ app.use('*', async (c, next) => {
 app.use('*', async (c, next) => {
   const method = c.req.method;
   const path = new URL(c.req.url).pathname;
-  if (method === 'GET' || method === 'OPTIONS' || method === 'HEAD' || path === '/health' || path === '/status' || path.startsWith('/public/')) return next();
+  const publicPath =
+    path === '/' ||
+    path === '/health' ||
+    path === '/status' ||
+    path === '/api' ||
+    path === '/billing/plans' ||
+    path === '/webhooks/stripe' ||
+    path.startsWith('/public/');
+  if (method === 'OPTIONS' || publicPath) return next();
   const apiKey = c.req.header('X-Echo-API-Key') || '';
   const bearer = (c.req.header('Authorization') || '').replace('Bearer ', '');
   const expected = c.env.ECHO_API_KEY;
-  if (!expected || (apiKey !== expected && bearer !== expected)) {
+  if (!expected) {
+    return json({ error: 'Service auth not configured' }, 503);
+  }
+  if (!constantTimeTokenEqual(apiKey, expected) && !constantTimeTokenEqual(bearer, expected)) {
     return json({ error: 'Unauthorized', message: 'Valid X-Echo-API-Key or Bearer token required for write operations' }, 401);
   }
   return next();
@@ -920,6 +931,15 @@ async function generatePaymentToken(invoiceId: string, tenantId: string, hmacKey
   return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+function constantTimeTokenEqual(presented: string, expected: string): boolean {
+  const length = Math.max(presented.length, expected.length);
+  let mismatch = presented.length ^ expected.length;
+  for (let index = 0; index < length; index += 1) {
+    mismatch |= (presented.charCodeAt(index) || 0) ^ (expected.charCodeAt(index) || 0);
+  }
+  return mismatch === 0;
+}
+
 // Create Stripe Checkout session for an invoice
 app.post('/invoices/:id/checkout', async (c) => {
   try {
@@ -1001,10 +1021,9 @@ app.get('/public/invoice/:id', async (c) => {
     const inv = await c.env.DB.prepare('SELECT i.*, c.name as client_name, c.company as client_company, c.email as client_email, c.address as client_address, c.city as client_city, c.state as client_state, c.zip as client_zip, t.name as tenant_name, t.email as tenant_email, t.phone as tenant_phone, t.address as tenant_address FROM invoices i LEFT JOIN clients c ON i.client_id=c.id LEFT JOIN tenants t ON i.tenant_id=t.id WHERE i.id=?').bind(invId).first() as any;
     if (!inv) return new Response('Invoice not found', { status: 404 });
 
-    if (c.env.INVOICE_HMAC_KEY) {
-      const expected = await generatePaymentToken(invId, inv.tenant_id, c.env.INVOICE_HMAC_KEY);
-      if (token !== expected) return new Response('Invalid token', { status: 403 });
-    }
+    if (!c.env.INVOICE_HMAC_KEY) return new Response('Invoice token verification is not configured', { status: 503 });
+    const expected = await generatePaymentToken(invId, inv.tenant_id, c.env.INVOICE_HMAC_KEY);
+    if (!constantTimeTokenEqual(token, expected)) return new Response('Invalid token', { status: 403 });
 
     // Mark as viewed
     await c.env.DB.prepare("UPDATE invoices SET viewed_at=coalesce(viewed_at,datetime('now')),status=CASE WHEN status='sent' THEN 'viewed' ELSE status END WHERE id=?").bind(invId).run();
@@ -1057,15 +1076,14 @@ app.post('/webhooks/stripe', async (c) => {
     const body = await c.req.text();
     const sig = c.req.header('stripe-signature') || '';
 
-    // Verify webhook signature if secret is configured
-    if (c.env.STRIPE_WEBHOOK_SECRET) {
-      const isValid = await verifyStripeSignature(body, sig, c.env.STRIPE_WEBHOOK_SECRET);
-      if (!isValid) {
-        structuredLog('warn', 'Invalid Stripe webhook signature');
-        return json({ error: 'Invalid signature' }, 401);
-      }
-    } else {
-      structuredLog('warn', 'STRIPE_WEBHOOK_SECRET not set — skipping signature verification');
+    if (!c.env.STRIPE_WEBHOOK_SECRET) {
+      structuredLog('error', 'Stripe webhook verification is not configured');
+      return json({ error: 'Webhook verification not configured' }, 503);
+    }
+    const isValid = await verifyStripeSignature(body, sig, c.env.STRIPE_WEBHOOK_SECRET);
+    if (!isValid) {
+      structuredLog('warn', 'Invalid Stripe webhook signature');
+      return json({ error: 'Invalid signature' }, 401);
     }
 
     const event = JSON.parse(body);
@@ -1138,7 +1156,7 @@ async function verifyStripeSignature(payload: string, header: string, secret: st
     const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
     const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(signedPayload));
     const expected = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
-    return expected === signature;
+    return constantTimeTokenEqual(expected, signature);
   } catch { return false; }
 }
 
@@ -1147,7 +1165,8 @@ async function verifyStripeSignature(payload: string, header: string, secret: st
 app.post('/admin/migrate-stripe', async (c) => {
   try {
     const apiKey = c.req.header('X-Echo-API-Key') || '';
-    if (!c.env.ECHO_API_KEY || apiKey !== c.env.ECHO_API_KEY) return json({ error: 'Unauthorized' }, 401);
+    if (!c.env.ECHO_API_KEY) return json({ error: 'Service auth not configured' }, 503);
+    if (!constantTimeTokenEqual(apiKey, c.env.ECHO_API_KEY)) return json({ error: 'Unauthorized' }, 401);
     const results: string[] = [];
     const cols = [
       { name: 'payment_token', type: 'TEXT' },
@@ -1236,10 +1255,9 @@ app.post('/public/invoice/:id/pay', async (c) => {
     const inv = await c.env.DB.prepare('SELECT i.*, c.email as client_email FROM invoices i LEFT JOIN clients c ON i.client_id=c.id WHERE i.id=?').bind(invId).first() as any;
     if (!inv) return new Response('Invoice not found', { status: 404 });
 
-    if (c.env.INVOICE_HMAC_KEY) {
-      const expected = await generatePaymentToken(invId, inv.tenant_id, c.env.INVOICE_HMAC_KEY);
-      if (token !== expected) return new Response('Invalid token', { status: 403 });
-    }
+    if (!c.env.INVOICE_HMAC_KEY) return new Response('Invoice token verification is not configured', { status: 503 });
+    const expected = await generatePaymentToken(invId, inv.tenant_id, c.env.INVOICE_HMAC_KEY);
+    if (!constantTimeTokenEqual(token, expected)) return new Response('Invalid token', { status: 403 });
 
     if (inv.status === 'paid' || inv.status === 'void') return new Response('Invoice already settled', { status: 400 });
     if (!c.env.STRIPE_SECRET_KEY) return new Response('Payments not configured', { status: 503 });
@@ -1286,7 +1304,10 @@ app.get('/__cron', async (c) => {
   const apiKey = c.req.header('X-Echo-API-Key') || '';
   const bearer = (c.req.header('Authorization') || '').replace('Bearer ', '');
   const expected = c.env.ECHO_API_KEY;
-  if (!expected || (apiKey !== expected && bearer !== expected)) {
+  if (!expected) {
+    return json({ error: 'Service auth not configured' }, 503);
+  }
+  if (!constantTimeTokenEqual(apiKey, expected) && !constantTimeTokenEqual(bearer, expected)) {
     return json({ error: 'Unauthorized' }, 401);
   }
   try {
