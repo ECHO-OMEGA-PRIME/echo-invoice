@@ -381,11 +381,6 @@ def _check_auth(endpoint: str, x_echo_api_key: str | None) -> dict[str, Any]:
 
     expected = api_key()
     if not expected:
-        if _dev_mode():
-            logger.warning("dev_mode: auth bypass for endpoint=%s", endpoint)
-            ctx["authenticated"] = True
-            ctx["principal"] = "dev"
-            return ctx
         logger.error("auth misconfigured: ECHO_API_KEY not set for endpoint=%s", endpoint)
         raise HTTPException(503, "service auth not configured")
 

@@ -13,7 +13,7 @@ class ServiceAuthenticationTests(unittest.TestCase):
     def test_missing_service_key_returns_503(self) -> None:
         with (
             patch.object(security, "api_key", return_value=""),
-            patch.object(security, "_dev_mode", return_value=False),
+            patch.object(security, "_dev_mode", return_value=True),
             self.assertRaises(HTTPException) as raised,
         ):
             security.require_auth("tenants.list", None)

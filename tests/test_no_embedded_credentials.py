@@ -52,7 +52,7 @@ COMPATIBILITY_DIRS = {
     "echo-log-aggregator": "echo_log_aggregator",
     "echo-qa-tester": "echo-qa-tester",
 }
-SENSITIVE_NAME = r"[A-Z][A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL)[A-Z0-9_]*"
+SENSITIVE_NAME = r"(?:API_KEY|ADMIN_KEY|[A-Z][A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|ADMIN_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL)[A-Z0-9_]*)"
 RULES = {
     "python_nonempty_sensitive_default": re.compile(
         rf"""os\.(?:getenv|environ\.get)\(\s*["']{SENSITIVE_NAME}["']\s*,\s*["'][^"']+["']"""
@@ -61,7 +61,7 @@ RULES = {
         rf"""(?:process\.env|env)\.{SENSITIVE_NAME}\s*(?:\?\?|\|\|)\s*["'][^"']+["']"""
     ),
     "javascript_timing_unsafe_sensitive_comparison": re.compile(
-        rf"""\b(?:apiKey|key|token|signature|secret)\b\s*(?:===|!==)\s*(?:c\.)?env\.{SENSITIVE_NAME}""",
+        rf"""\b(?:apiKey|adminKey|key|token|signature|secret)\b\s*(?:===|!==)\s*(?:(?:c\.)?env\.{SENSITIVE_NAME}|(?:apiKey|adminKey|key|token|signature|secret)\b)""",
         re.IGNORECASE,
     ),
     "credentialed_database_url": re.compile(
@@ -74,6 +74,11 @@ RULES = {
     ),
     "private_key_material": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     "known_access_key_shape": re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+}
+MULTILINE_RULES = {
+    "dev_mode_auth_bypass": re.compile(
+        r"""if\s+_dev_mode\(\)\s*:[\s\S]{0,400}?ctx\[\"authenticated\"\]\s*=\s*True""",
+    ),
 }
 
 
@@ -154,5 +159,10 @@ def test_repository_contains_no_embedded_credentials() -> None:
                 if pattern.search(line):
                     location = Path(scan_root.name) / path.relative_to(scan_root)
                     findings.append(f"{location}:{line_number}:{rule_name}")
+        for rule_name, pattern in MULTILINE_RULES.items():
+            for match in pattern.finditer(source):
+                line_number = source.count("\n", 0, match.start()) + 1
+                location = Path(scan_root.name) / path.relative_to(scan_root)
+                findings.append(f"{location}:{line_number}:{rule_name}")
 
     assert not findings, "Embedded credential indicators found:\n" + "\n".join(findings)
